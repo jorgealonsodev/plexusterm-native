@@ -472,13 +472,25 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
-        wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display,
-        })
+        // PlexusTerm patch (vendor/gpui_wgpu/PATCHES.md): Vulkan only, so the GL/EGL stacks are
+        // not loaded next to it; GL only when Vulkan has no adapter at all.
+        let display: Option<Arc<dyn wgpu::wgt::WgpuHasDisplayHandle>> = display.map(Arc::from);
+        let new_instance = |backends| {
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: display.clone().map(|d| Box::new(d) as _),
+            })
+        };
+        let vulkan = new_instance(wgpu::Backends::VULKAN);
+        if !gpui::block_on(vulkan.enumerate_adapters(wgpu::Backends::VULKAN)).is_empty() {
+            return vulkan;
+        }
+        log::warn!("No Vulkan adapter found, falling back to GL");
+        drop(vulkan);
+        new_instance(wgpu::Backends::GL)
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
