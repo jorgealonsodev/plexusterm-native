@@ -84,9 +84,15 @@ impl LocalSession {
     pub fn start() -> Result<Self, StartError> {
         let (columns, rows) = (80, 24);
         let ring = ByteRing::new(ByteRing::SESSION_CAPACITY);
+        let mut env = proto_pty::ChildEnv::default();
+        #[cfg(target_os = "linux")]
+        for name in crate::vk_driver::variables_to_hide(&|name| std::env::var_os(name)) {
+            env = env.without(*name);
+        }
         let spec = SpawnSpec {
             columns,
             rows,
+            env,
             ..SpawnSpec::default()
         };
         let (pty, writer) = proto_pty::spawn(spec, ring.clone()).map_err(|e| StartError(e.to_string()))?;

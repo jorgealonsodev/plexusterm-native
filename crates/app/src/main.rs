@@ -9,6 +9,8 @@ mod keys;
 mod latency;
 mod startup;
 mod terminal;
+#[cfg(target_os = "linux")]
+mod vk_driver;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px, size};
 use ui_theme::{DEFAULT_SCHEME_ID, scheme_by_id, ui_tokens};
@@ -16,6 +18,9 @@ use ui_theme::{DEFAULT_SCHEME_ID, scheme_by_id, ui_tokens};
 use crate::terminal::{LocalSession, TerminalView};
 
 fn main() {
+    // NFR-3/NFR-4 (T6c): before anything else, so the restarted process does all the work.
+    #[cfg(target_os = "linux")]
+    vk_driver::reexec_with_display_driver();
     startup::begin();
     // ST-7: the shell starts first, so its own startup runs while GPUI and the GPU initialise.
     let local = match LocalSession::start() {
