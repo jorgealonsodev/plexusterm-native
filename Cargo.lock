@@ -3114,6 +3114,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace-model"
+version = "0.1.0"
+
+[[package]]
 name = "zbus"
 version = "5.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
