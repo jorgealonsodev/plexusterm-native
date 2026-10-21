@@ -19,8 +19,9 @@ Branch: `feat/m0-spike`. Delivery strategy: `ask-on-risk`. Test runner: `cargo t
 | --- | --- | --- | --- | --- |
 | T1 | S1 | inline | done | commit `feat: scaffold workspace and ui-theme` (see L4) |
 | T2 | S2 | inline | done | RED 3/13 failing on `mix`/`readable_on` stubs → GREEN 13/13 (L4) |
-| T3 | S3 | inline | in progress | |
-| T4 | S4 | inline | pending | |
+| T3 | S3 (ST-1..6, ST-8) | inline | done | commit `feat(term-engine)…`; 15 tests, 4 neuter checks (L5) |
+| T3b | S3 (ST-9 input caps) | inline | pending | |
+| T4 | S4 | inline | in progress | |
 | T5 | S5 | inline | pending | needs system packages (see Log) |
 | T6 | S6 | inline | pending | |
 | T7 | S7 | inline | pending | |
@@ -31,3 +32,4 @@ Branch: `feat/m0-spike`. Delivery strategy: `ask-on-risk`. Test runner: `cargo t
 - **L2** Context: PRD v4.0 (`docs/PRD.md`), parity matrix (`docs/parity-matrix.md`), reference screenshots (`docs/reference/`). Owner decisions so far: GPUI (D1), stability architecture §6.3 (D7), GPU on by default on Linux (§4.1), no invented crash UI (ST-8), relay crates are the owner's, MIT.
 - **L3** Host: rustc 1.98.1, X11 session, NVIDIA GTX 1080 + Intel UHD 630 (Vulkan 1.4). Missing for GPUI builds: `libxkbcommon-x11-dev`, `libvulkan-dev`, `libx11-xcb-dev`, `libssl-dev`, `clang` (T5 blocker until installed).
 - **L4** T1+T2: workspace (edition 2024, toolchain 1.98.1, ST-12 lints with clippy.toml test allowances, `panic = "unwind"`), `ui-theme` with 57 generated schemes (`scripts/gen_schemes.py`) and THEME-1 derivation. Tests ported from `uiTheme.test.ts`/`themes.test.ts` + golden `surface` and 0.4-threshold edge cases. `cargo test --workspace`: 13 passed; `cargo clippy --workspace --all-targets -- -D warnings`: clean. Risk: none.
+- **L5** T3: `term-engine` = `ByteRing` (bounded, blocking push = backpressure, try_push for keys), `Session` (parser thread with `FairMutex<Term>`, ≤ 1 MiB / 4 ms slices, dirty flag + `Wakeup` once per batch, damage-only `Frame`s, coalesced resize via `on_resize`, write queue 4 MiB drained in ≤ 64 KiB writes, paste helper thread, `catch_unwind` supervision → `EndReason::Failed`, OSC 52 disabled as in v0.2.15). Tests: ring 5, session 10, all green ×5 runs. Neuters observed failing: always-full snapshot (4 fail), no panic isolation (1 fail), unbounded ring (2 fail), single-write paste (1 fail). Known gap: keystrokes typed during a running paste may interleave with it (v0.2.15 sends a paste at once) — revisit with the app. ST-9 caps split into T3b. Risk: item 4 (concurrency: locks and thread handoff) — covered by the tests above; independent verifier deferred to the M0 end per the feature-level verification timing.
