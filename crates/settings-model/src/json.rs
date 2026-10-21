@@ -1,0 +1,166 @@
+//! A JSON tree that keeps the order of object keys, as JavaScript objects do.
+//!
+//! settings.json depends on it twice: of two clashing shortcut overrides the one written later
+//! is dropped (KEY-5), and unknown keys are written back as they were (PRD §4.1 deviation 2).
+//! `serde_json::Value` sorts keys unless the `preserve_order` feature is on, and turning that
+//! feature on would change the output of every crate in the workspace that uses `Value`.
+
+use std::fmt;
+
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
+use serde_json::Number;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Json {
+    Null,
+    Bool(bool),
+    Number(Number),
+    String(String),
+    Array(Vec<Json>),
+    /// Keys in the order they were written; a repeated key keeps its first place and its last
+    /// value, like `JSON.parse`.
+    Object(Vec<(String, Json)>),
+}
+
+impl Json {
+    pub fn parse(text: &str) -> Option<Json> {
+        serde_json::from_str(text).ok()
+    }
+
+    pub fn to_pretty_string(&self) -> String {
+        // Serializing this tree cannot fail: every key is a string and every number is finite.
+        serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Json::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Json::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// The value of a number, like JavaScript's `typeof value === "number"`.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Json::Number(n) => n.as_f64(),
+            _ => None,
+        }
+    }
+
+    /// A number written the way JavaScript writes it: whole values without a fraction.
+    pub fn number(value: f64) -> Json {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "only whole values well inside i64 are cast"
+        )]
+        let whole = (value.fract() == 0.0 && value.abs() < 9.0e15).then_some(value as i64);
+        match whole {
+            Some(int) => Json::Number(Number::from(int)),
+            None => Number::from_f64(value).map_or(Json::Null, Json::Number),
+        }
+    }
+}
+
+impl Serialize for Json {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Json::Null => serializer.serialize_unit(),
+            Json::Bool(b) => serializer.serialize_bool(*b),
+            Json::Number(n) => n.serialize(serializer),
+            Json::String(s) => serializer.serialize_str(s),
+            Json::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Json::Object(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+struct JsonVisitor;
+
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Json;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Json, E> {
+        Ok(Json::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Json, E> {
+        Ok(Json::Number(v.into()))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Json, E> {
+        Ok(Json::Number(v.into()))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Json, E> {
+        Ok(Number::from_f64(v).map_or(Json::Null, Json::Number))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Json, E> {
+        Ok(Json::String(v.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Json, E> {
+        Ok(Json::String(v))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Json, E> {
+        Ok(Json::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Json, E> {
+        Ok(Json::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Json, D::Error> {
+        Json::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Json::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut entries: Vec<(String, Json)> = Vec::new();
+        while let Some((key, value)) = map.next_entry::<String, Json>()? {
+            match entries.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = value,
+                None => entries.push((key, value)),
+            }
+        }
+        Ok(Json::Object(entries))
+    }
+}
+
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Json, D::Error> {
+        deserializer.deserialize_any(JsonVisitor)
+    }
+}
