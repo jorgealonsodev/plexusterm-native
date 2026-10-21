@@ -2608,6 +2608,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -2666,6 +2667,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow",
+]
+
+[[package]]
+name = "tools"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "hmac",
+ "proto-ssh",
+ "rand",
+ "russh",
+ "tempfile",
+ "term-engine",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
