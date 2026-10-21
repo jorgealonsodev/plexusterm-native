@@ -185,15 +185,57 @@ const STATUS_ARGS: [&str; 6] = ["status", "--porcelain=v1", "-z", "--ignored=mat
 
 /// Runs `git --no-optional-locks <args>` in `folder`; its stdout (at most [`MAX_STATUS_BYTES`]),
 /// or `None` when git is missing or fails.
+///
+/// A folder from elsewhere (a downloaded archive with a `.git`) must never run a program just by
+/// being listed, so the repository's fsmonitor command is off and every filter driver its config
+/// declares is replaced by a no-op: `git status` would otherwise run a `clean` or `process`
+/// filter to re-hash a file whose stat data changed.
 fn run_git(folder: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut overrides = Vec::new();
+    for name in declared_filters(folder) {
+        overrides.extend([
+            "-c".to_owned(),
+            format!("filter.{name}.clean=cat"),
+            "-c".to_owned(),
+            format!("filter.{name}.smudge=cat"),
+            "-c".to_owned(),
+            format!("filter.{name}.process="),
+            "-c".to_owned(),
+            format!("filter.{name}.required=false"),
+        ]);
+    }
+    git_output(folder, &overrides, args)
+}
+
+/// The filter driver names the config seen from `folder` declares; reading config runs nothing.
+/// Empty when none match (`git config --get-regexp` then exits with 1) or git is missing.
+fn declared_filters(folder: &Path) -> Vec<String> {
+    let names = git_output(
+        folder,
+        &[],
+        &["config", "--name-only", "-z", "--get-regexp", r"^filter\..*\.[^.]*$"],
+    );
+    let names = names.unwrap_or_default();
+    let mut filters: Vec<String> = names
+        .split(|&b| b == 0)
+        .filter_map(|key| std::str::from_utf8(key).ok())
+        .filter_map(|key| key.strip_prefix("filter."))
+        .filter_map(|rest| rest.rsplit_once('.').map(|(name, _)| name.to_owned()))
+        .collect();
+    filters.sort();
+    filters.dedup();
+    filters
+}
+
+/// Runs `git --no-optional-locks -c core.fsmonitor=false <config> <args>` in `folder`.
+fn git_output(folder: &Path, config: &[String], args: &[&str]) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut command = Command::new("git");
     command
         .arg("--no-optional-locks")
-        // Never the repository's own fsmonitor command: a folder from elsewhere (a downloaded
-        // archive with a `.git`) could otherwise run any program just by being listed.
         .args(["-c", "core.fsmonitor=false"])
+        .args(config)
         .args(args)
         .current_dir(folder)
         .stdin(Stdio::null())

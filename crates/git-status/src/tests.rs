@@ -648,3 +648,67 @@ mod ssh_tests {
         assert_eq!(ssh_git_status(&ssh, id, "/a\0b").await, vec![]);
     }
 }
+
+#[cfg(unix)]
+mod hostile_repository_tests {
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A downloaded archive with a `.git` whose config declares a filter that runs a command.
+    fn hostile_repo(marker: &std::path::Path, process: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("file.txt"), "content\n").unwrap();
+        git(d, &["add", "file.txt"]);
+        git(d, &["commit", "-qm", "init"]);
+        let command = format!("touch '{}'; cat", marker.display());
+        let key = if process {
+            "filter.evil.process"
+        } else {
+            "filter.evil.clean"
+        };
+        git(d, &["config", key, &command]);
+        std::fs::write(d.join(".gitattributes"), "* filter=evil\n").unwrap();
+        // A freshly extracted file never matches the index's stat data.
+        std::fs::write(d.join("file.txt"), "content\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(d.join("file.txt"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn listing_a_hostile_repository_never_runs_its_clean_filter() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("ran");
+        let repo = hostile_repo(&marker, false);
+        let _ = crate::status_of(repo.path());
+        let _ = crate::repo_of(repo.path());
+        assert!(!marker.exists(), "the repository's clean filter ran");
+    }
+
+    #[test]
+    fn listing_a_hostile_repository_never_runs_its_process_filter() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("ran");
+        let repo = hostile_repo(&marker, true);
+        let _ = crate::status_of(repo.path());
+        assert!(!marker.exists(), "the repository's process filter ran");
+    }
+}
