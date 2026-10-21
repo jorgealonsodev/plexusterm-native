@@ -7,6 +7,7 @@
 //! calls these methods and draws what they hold.
 
 pub mod dev_mode;
+pub mod dev_view;
 pub mod layout;
 pub mod multi_exec;
 pub mod recent_folders;
@@ -17,6 +18,11 @@ pub use dev_mode::{
     DEFAULT_DEV_COMMANDS, DevMode, DevState, DevTab, LocateRequest, MAX_DEV_COMMAND_LENGTH, MAX_DEV_COMMANDS,
     clean_dev_commands, cli_of_command, cli_of_title, default_dev_commands, dev_commands_text, parse_dev_commands,
     title_keeps_cli, title_without_cli_mark, with_default_commands,
+};
+pub use dev_view::{
+    ColumnAtStartup, DevColumn, FooterInput, PaneFooter, TAB_COLUMN_DEFAULT_WIDTH, TAB_COLUMN_FOLDED_WIDTH,
+    TAB_COLUMN_MAX_WIDTH, TAB_COLUMN_MIN_WIDTH, TargetKind, TerminalRow, basename, clamp_tab_column_width, cli_name,
+    dev_button_allowed, dev_hidden_panes, pane_footer, row_title, terminal_rows,
 };
 pub use layout::{
     FocusDirection, MAX_PANES, MAX_RATIO, MIN_RATIO, PaneId, PaneLayout, Rect, Side, Split, SplitBox, SplitDirection,
