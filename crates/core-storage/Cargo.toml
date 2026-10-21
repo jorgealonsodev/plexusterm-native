@@ -1,0 +1,17 @@
+[package]
+name = "core-storage"
+description = "Config directory and atomic, private JSON documents, compatible with PlexusTerm v0.2.15 (PRD §9)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs = "=7.0.0"
+serde_json = "=1.0.154"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true
