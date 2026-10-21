@@ -1105,6 +1105,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-status"
+version = "0.1.0"
+dependencies = [
+ "proto-ssh",
+ "russh",
+ "tempfile",
+ "term-engine",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "gloo-timers"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
