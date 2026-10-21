@@ -29,6 +29,9 @@ pub const TEXT_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// Upper bound for history.json: 200 hosts x 2000 commands fit well below it.
 pub const HISTORY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+/// A temp file of another process this old belongs to a writer that died.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Makes temp file names unique across concurrent writes in this process.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Serializes writes made by this process: Windows refuses concurrent renames onto one file.
@@ -78,18 +81,9 @@ pub fn save(path: &Path, contents: &str) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| io(parent, err))?;
     }
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    tmp_name.push(format!(".tmp-{}-{seq}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-
     let _guard = WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let result = write_private(&tmp, contents.as_bytes()).and_then(|()| replace_file(&tmp, path));
-    if let Err(err) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io(path, err));
-    }
-    Ok(())
+    remove_stale_temps(path);
+    replace_atomically(path, contents.as_bytes(), Some(0o600)).map_err(|err| io(path, err))
 }
 
 /// Replaces history.json, refusing invalid JSON and oversized contents.
@@ -128,7 +122,10 @@ pub fn write_text(path: &Path, contents: &str, max_bytes: u64) -> Result<(), Sto
     if contents.len() as u64 > max_bytes {
         return Err(too_large(path, max_bytes));
     }
-    std::fs::write(path, contents).map_err(|err| io(path, err))
+    // Write through a symlink to its file, and keep that file's permissions.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mode = existing_mode(&target);
+    replace_atomically(&target, contents.as_bytes(), mode).map_err(|err| io(path, err))
 }
 
 /// Appends to a text file the user chose (e.g. a session log), creating it when missing.
@@ -171,13 +168,97 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Creates (or truncates) `path` readable only by the user and writes `contents` durably.
-fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// Writes `contents` to a new temp file next to `path`, makes it durable and renames it over
+/// `path`, then makes the rename durable: the file is either the old one or the new one, never
+/// partial, and a reported success survives a crash. `mode` (Unix) sets the new file's permissions.
+fn replace_atomically(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    let tmp = temp_path(path);
+    let result = write_new(&tmp, contents, mode).and_then(|()| replace_file(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    sync_parent(path);
+    Ok(())
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".tmp-{}-{seq}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Removes `<name>.tmp-<pid>-<n>` files of this document left by a writer that died before its
+/// rename. Temp files of this process, and recent ones of another process (v0.2.15 may be
+/// writing the same document right now), are kept.
+fn remove_stale_temps(path: &Path) {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{name}.tmp-");
+    let ours = format!("{prefix}{}-", std::process::id());
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else { continue };
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age >= STALE_TEMP_AGE));
+        if file_name.starts_with(&prefix) && !file_name.starts_with(&ours) && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Creates `path` (it must not exist) with `mode` on Unix and writes `contents` durably.
+fn write_new(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    if let Some(mode) = mode {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut file = options.open(path)?;
+    // The umask may have narrowed the requested mode; set it exactly.
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
     file.write_all(contents)?;
     file.sync_all()
+}
+
+#[cfg(unix)]
+fn existing_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn existing_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Makes a rename in `path`'s directory durable (Unix); best effort.
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

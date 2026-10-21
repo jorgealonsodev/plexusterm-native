@@ -16,7 +16,10 @@ fn the_config_directory_is_taurus_app_config_dir() {
         Some(PathBuf::from("/home/u/.config/dev.plexusterm.app"))
     );
     assert_eq!(config_dir_in(None), None);
-    assert!(config_dir().is_some_and(|dir| dir.ends_with("dev.plexusterm.app")));
+    // `dirs` finds no base without HOME/XDG_CONFIG_HOME (some sandboxes); the name is checked when it does.
+    if let Some(dir) = config_dir() {
+        assert!(dir.ends_with("dev.plexusterm.app"));
+    }
 }
 
 #[test]
@@ -159,4 +162,64 @@ fn history_round_trips_and_refuses_oversized_contents() {
         Some(r#"{"version":1,"hosts":{}}"#),
         "the previous history is kept"
     );
+}
+
+#[test]
+fn save_removes_old_temp_files_left_by_a_crashed_writer_but_not_fresh_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let leftover = |name: &str, modified: Option<std::time::SystemTime>| {
+        let file = std::fs::File::create(dir.path().join(name)).unwrap();
+        if let Some(time) = modified {
+            file.set_modified(time).unwrap();
+        }
+    };
+    // Another writer (pid 1 is never us) died an hour ago; another one is writing right now.
+    leftover("settings.json.tmp-1-0", Some(old));
+    leftover("settings.json.tmp-1-1", None);
+    leftover("other.json.tmp-1-0", Some(old));
+    save(&path, "{}").unwrap();
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["other.json.tmp-1-0", "settings.json", "settings.json.tmp-1-1"],
+        "only this document's old leftovers are removed; a concurrent writer's temp file is kept"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_text_replaces_the_file_atomically_keeping_its_mode_and_symlink() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("output.txt");
+    write_text(&path, "old\n", 1024).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let link = dir.path().join("link.txt");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    let before = std::fs::metadata(&path).unwrap().ino();
+    write_text(&link, "new\n", 1024).unwrap();
+    let after = std::fs::metadata(&path).unwrap();
+    assert_ne!(
+        after.ino(),
+        before,
+        "a new file was renamed into place instead of truncating the old one"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+    assert_eq!(after.permissions().mode() & 0o777, 0o640, "the mode is kept");
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        "the link still points at the file"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["link.txt", "output.txt"], "no temp file is left");
 }
