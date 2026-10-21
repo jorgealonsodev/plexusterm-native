@@ -71,6 +71,22 @@ async fn openssh_sftp_round_trip() {
     assert!(std::fs::read(&back).unwrap() == payload, "downloaded bytes differ");
     assert!(!sftp::partial_path(&back).exists());
 
+    // OpenSSH refuses to rename over a file (SFTP v3): replacing goes through a swap, and a
+    // failed upload keeps the original.
+    let replacement = dir.path().join("payload.bin");
+    std::fs::write(&replacement, b"replaced").unwrap();
+    sftp::upload_file(&session, &replacement, &remote).await.unwrap();
+    assert!(sftp::upload_file(&session, dir.path(), &remote).await.is_err());
+    sftp::download(&session, &remote, &back).await.unwrap();
+    assert_eq!(std::fs::read(&back).unwrap(), b"replaced");
+    let names: Vec<_> = sftp::list(&session, &work)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["payload.bin"], "the swap left a file behind");
+
     // Exclusive create, the changed-on-disk check, chmod and a refused move.
     let notes = format!("{work}/notes.txt");
     sftp::create_file(&session, &notes).await.unwrap();

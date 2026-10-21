@@ -253,28 +253,80 @@ pub async fn upload(sftp: &SftpSession, local: &Path, remote_dir: &str) -> Resul
     Ok(remote)
 }
 
-/// Streams the local file `local` into the remote file `remote` (created or truncated).
+/// Streams the local file `local` into the remote file `remote`, creating or replacing it; a
+/// failed upload leaves an existing `remote` as it was.
 pub async fn upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<(), SftpError> {
+    use russh_sftp::protocol::{FileAttributes, OpenFlags};
     use tokio::io::AsyncWriteExt;
 
     let local_label = local.display().to_string();
     let source = tokio::fs::File::open(local)
         .await
         .map_err(|err| failure("read", &local_label, err))?;
-    // `create` opens with CREATE | TRUNCATE | WRITE; `SftpSession::write` would not create the file.
+    // The bytes go to a new file next to the target first: a failed upload never touches the
+    // original, and the swap at the end is a rename on the server.
+    let temp = upload_temp_path(remote);
     let mut target = sftp
-        .create(remote)
+        .open_with_flags(&temp, OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE)
         .await
         .map_err(|err| failure("upload to", remote, err))?;
     let mut reader = tokio::io::BufReader::with_capacity(TRANSFER_CHUNK, source);
-    tokio::io::copy_buf(&mut reader, &mut target)
-        .await
-        .map_err(|err| failure("upload to", remote, err))?;
-    // Waits for every pending write to be acknowledged.
-    target
-        .shutdown()
-        .await
-        .map_err(|err| failure("upload to", remote, err))?;
+    // `shutdown` waits for every pending write to be acknowledged.
+    let copied = match tokio::io::copy_buf(&mut reader, &mut target).await {
+        Ok(_) => target.shutdown().await,
+        Err(err) => Err(err),
+    };
+    drop(target);
+    if let Err(err) = copied {
+        let _ = sftp.remove_file(&temp).await;
+        return Err(failure("upload to", remote, err));
+    }
+    let original = sftp.metadata(remote).await.ok();
+    if let Some(permissions) = original.as_ref().and_then(|meta| meta.permissions) {
+        // Keep the replaced file's mode; best effort, as the owner may differ.
+        let mode = FileAttributes {
+            permissions: Some(permissions & 0o7777),
+            ..FileAttributes::empty()
+        };
+        let _ = sftp.set_metadata(&temp, mode).await;
+    }
+    replace_with(sftp, &temp, remote, original.is_some()).await
+}
+
+/// A hidden name next to `remote` for an upload in progress.
+fn upload_temp_path(remote: &str) -> String {
+    let (dir, name) = match remote.rsplit_once('/') {
+        Some(("", name)) => ("/", name),
+        Some((dir, name)) => (dir, name),
+        None => (".", remote),
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    join(dir, &format!(".{name}.plexus-upload-{}-{nonce}", std::process::id()))
+}
+
+/// Moves the finished `temp` to `remote`. SFTP v3 servers such as OpenSSH refuse to rename over
+/// an existing file, so the original is first moved aside and restored if the swap fails.
+async fn replace_with(sftp: &SftpSession, temp: &str, remote: &str, exists: bool) -> Result<(), SftpError> {
+    let Err(err) = sftp.rename(temp, remote).await else {
+        return Ok(());
+    };
+    if !exists {
+        let _ = sftp.remove_file(temp).await;
+        return Err(failure("upload to", remote, err));
+    }
+    let aside = format!("{temp}.old");
+    if let Err(err) = sftp.rename(remote, &aside).await {
+        let _ = sftp.remove_file(temp).await;
+        return Err(failure("upload to", remote, err));
+    }
+    if let Err(err) = sftp.rename(temp, remote).await {
+        let _ = sftp.rename(&aside, remote).await;
+        let _ = sftp.remove_file(temp).await;
+        return Err(failure("upload to", remote, err));
+    }
+    let _ = sftp.remove_file(&aside).await;
     Ok(())
 }
 
