@@ -124,7 +124,16 @@ pub fn write_text(path: &Path, contents: &str, max_bytes: u64) -> Result<(), Sto
     }
     // In place, as v0.2.15: a file the user chose keeps its owner, group, ACLs and links, and a
     // writable file in a read-only directory can still be written (a temp + rename would not).
-    std::fs::write(path, contents).map_err(|err| io(path, err))
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|err| io(path, err))?;
+    // Durable once reported: the bytes are on disk before success is returned.
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|err| io(path, err))
 }
 
 /// Appends to a text file the user chose (e.g. a session log), creating it when missing.
@@ -171,8 +180,8 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 /// `path`, then makes the rename durable: the file is either the old one or the new one, never
 /// partial, and a reported success survives a crash. `mode` (Unix) sets the new file's permissions.
 fn replace_atomically(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
-    let tmp = temp_path(path);
-    let result = write_new(&tmp, contents, mode).and_then(|()| replace_file(&tmp, path));
+    let tmp = write_temp(path, contents, mode, temp_path)?;
+    let result = replace_file(&tmp, path);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -181,22 +190,50 @@ fn replace_atomically(path: &Path, contents: &[u8], mode: Option<u32>) -> std::i
     Ok(())
 }
 
+/// `<name>.tmp-<pid>-<seq><nanos>`: unique within this process by `seq`, and across processes
+/// sharing a pid (pid namespaces) by the clock.
 fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    name.push(format!(".tmp-{}-{seq}", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    name.push(format!(".tmp-{}-{seq}{nanos:09}", std::process::id()));
     path.with_file_name(name)
 }
 
-/// Removes `<name>.tmp-<pid>-<n>` files of this document left by a writer that died before its
-/// rename. Temp files of this process, and recent ones of another process (v0.2.15 may be
-/// writing the same document right now), are kept.
+/// Writes `contents` to a new temp file beside `path` and returns its path. A name that is
+/// already taken (another live writer, or a leftover) is never touched: another name is tried.
+fn write_temp(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+    mut next_name: impl FnMut(&Path) -> PathBuf,
+) -> std::io::Result<PathBuf> {
+    let mut attempts = 0;
+    loop {
+        let tmp = next_name(path);
+        match write_new(&tmp, contents, mode) {
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempts < 8 => attempts += 1,
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                return Err(err);
+            }
+            Ok(()) => return Ok(tmp),
+        }
+    }
+}
+
+/// Removes `<name>.tmp-*` files of this document left by a writer that died before its rename.
+/// Only files older than [`STALE_TEMP_AGE`] go: a live writer (this process, v0.2.15, or another
+/// process with the same pid in another namespace) finishes its temp file long before that.
 fn remove_stale_temps(path: &Path) {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
         return;
     };
     let prefix = format!("{name}.tmp-");
-    let ours = format!("{prefix}{}-", std::process::id());
     let Ok(entries) = std::fs::read_dir(parent) else { return };
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -205,7 +242,7 @@ fn remove_stale_temps(path: &Path) {
             .metadata()
             .and_then(|meta| meta.modified())
             .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age >= STALE_TEMP_AGE));
-        if file_name.starts_with(&prefix) && !file_name.starts_with(&ours) && old {
+        if file_name.starts_with(&prefix) && old {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -221,14 +258,7 @@ fn write_new(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result
     }
     #[cfg(not(unix))]
     let _ = mode;
-    let mut file = match options.open(path) {
-        // A temp file of a crashed process that had our pid (pid namespaces reuse small pids).
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            std::fs::remove_file(path)?;
-            options.open(path)?
-        }
-        result => result?,
-    };
+    let mut file = options.open(path)?;
     // The umask may have narrowed the requested mode; set it exactly.
     #[cfg(unix)]
     if let Some(mode) = mode {
@@ -260,14 +290,40 @@ fn sync_parent(path: &Path) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_leftover_temp_file_with_our_own_name_is_replaced() {
-        let dir = std::env::temp_dir().join(format!("plexus-core-storage-{}-{}", std::process::id(), line!()));
+    fn scratch(line: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("plexus-core-storage-{}-{line}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let tmp = dir.join("settings.json.tmp-1-0");
-        std::fs::write(&tmp, "stale").unwrap();
-        write_new(&tmp, b"fresh", Some(0o600)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_taken_temp_name_is_left_alone_and_another_name_is_used() {
+        let dir = scratch(line!());
+        let target = dir.join("settings.json");
+        let taken = dir.join("settings.json.tmp-1-0");
+        std::fs::write(&taken, "another writer's data").unwrap();
+        let mut names = vec![dir.join("settings.json.tmp-1-1"), taken.clone()];
+        let tmp = write_temp(&target, b"fresh", Some(0o600), |_| names.pop().unwrap()).unwrap();
+        assert_eq!(tmp, dir.join("settings.json.tmp-1-1"));
+        assert_eq!(
+            std::fs::read_to_string(&taken).unwrap(),
+            "another writer's data",
+            "never unlinked"
+        );
         assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "fresh");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_temp_files_of_this_pid_are_swept_too() {
+        let dir = scratch(line!());
+        let target = dir.join("settings.json");
+        let leftover = dir.join(format!("settings.json.tmp-{}-0", std::process::id()));
+        let file = std::fs::File::create(&leftover).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        remove_stale_temps(&target);
+        assert!(!leftover.exists(), "a crashed process with our pid left it");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
