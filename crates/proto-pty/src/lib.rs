@@ -25,6 +25,8 @@ const READ_CHUNK: usize = 64 * 1024;
 const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 /// How long a hung-up program has before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(2);
+/// How often the waiter checks whether the process ended (reaping happens only under a lock).
+const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// Environment variables for the child; `Debug` shows only their names, so values such as
 /// `MOSH_KEY` never reach logs or panic messages (TERM-1b).
@@ -72,9 +74,16 @@ fn error(e: impl std::fmt::Display) -> PtyError {
     PtyError(e.to_string())
 }
 
-/// Ends the process: a hang-up first, then `SIGKILL` to its process group if it is still running.
+/// Ends the process: a hang-up first, then `SIGKILL` to the terminal's foreground job and to the
+/// shell's process group if they are still running.
+///
+/// The child is only reaped under the `child` lock, and the kill of the shell's group takes that
+/// lock and checks the exit first, so a reaped pid that the system reused is never signalled.
 struct Terminator {
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    child: Mutex<Box<dyn Child + Send + Sync>>,
+    /// Sends the hang-up without waiting (unlike `Child::kill`, which blocks for a grace period).
+    hangup: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pid: Option<u32>,
     /// `None` while running; `Some(code)` once the process ended.
     exit: Mutex<Option<Option<u32>>>,
@@ -85,44 +94,83 @@ impl Terminator {
         self.exit.lock().unwrap_or_else(PoisonError::into_inner).is_some()
     }
 
-    fn terminate(self: &Arc<Self>) {
+    /// Reaps the child if it ended; returns whether it has.
+    fn poll(&self) -> bool {
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        self.reap_if_done(child.as_mut())
+    }
+
+    fn reap_if_done(&self, child: &mut (dyn Child + Send + Sync)) -> bool {
         if self.exited() {
-            return;
+            return true;
         }
-        // The process may already be gone.
-        let _ = self.killer.lock().unwrap_or_else(PoisonError::into_inner).kill();
+        let code = match child.try_wait() {
+            Ok(None) => return false,
+            Ok(Some(status)) => Some(status.exit_code()),
+            Err(_) => None,
+        };
+        *self.exit.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+        true
+    }
+
+    fn terminate(self: &Arc<Self>) {
+        let foreground = {
+            let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.reap_if_done(child.as_mut()) {
+                return;
+            }
+            // Read before the hang-up: once the shell is gone the terminal has no foreground job.
+            let foreground = self
+                .master
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .process_group_leader();
+            let _ = self.hangup.lock().unwrap_or_else(PoisonError::into_inner).kill();
+            foreground
+        };
         let this = self.clone();
         let _ = thread::Builder::new().name("pty-reaper".into()).spawn(move || {
             let deadline = Instant::now() + HANGUP_GRACE;
-            while Instant::now() < deadline {
-                if this.exited() {
-                    return;
-                }
+            while Instant::now() < deadline && !this.exited() {
                 thread::sleep(Duration::from_millis(20));
             }
-            this.force_kill();
+            this.force_kill(foreground);
         });
     }
 
     #[cfg(unix)]
-    fn force_kill(&self) {
+    fn force_kill(&self, foreground: Option<i32>) {
         use rustix::process::{Pid, Signal, kill_process_group};
-        let pid = self.pid.and_then(|pid| i32::try_from(pid).ok()).and_then(Pid::from_raw);
-        if let Some(pid) = pid {
-            // The shell leads its own process group (the PTY's session).
-            let _ = kill_process_group(pid, Signal::KILL);
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let shell = self.pid.and_then(|pid| i32::try_from(pid).ok());
+        // A job that ignores the hang-up outlives its shell; its group stays valid while it runs.
+        if let Some(group) = foreground.filter(|group| Some(*group) != shell).and_then(Pid::from_raw) {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+        if !self.reap_if_done(child.as_mut())
+            && let Some(group) = shell.and_then(Pid::from_raw)
+        {
+            let _ = kill_process_group(group, Signal::KILL);
         }
     }
 
     #[cfg(not(unix))]
-    fn force_kill(&self) {
-        // Windows: the killer already terminates the process outright.
+    fn force_kill(&self, _foreground: Option<i32>) {
+        // Windows: the hang-up already terminates the process outright.
+    }
+
+    /// Ends a child whose threads never started: nobody else would reap it.
+    fn reap_now(&self) {
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = child.kill();
+        let code = child.wait().ok().map(|status| status.exit_code());
+        *self.exit.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
     }
 }
 
 /// A running local terminal. Dropping it ends the process and the output stream.
 pub struct LocalPty {
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     terminator: Arc<Terminator>,
     output: ByteRing,
 }
@@ -158,9 +206,12 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
             return Err(error(e));
         }
     };
+    let master = Arc::new(Mutex::new(pair.master));
     let terminator = Arc::new(Terminator {
-        killer: Mutex::new(child.clone_killer()),
         pid: child.process_id(),
+        hangup: Mutex::new(child.clone_killer()),
+        child: Mutex::new(child),
+        master: master.clone(),
         exit: Mutex::new(None),
     });
 
@@ -178,10 +229,10 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
     };
     let waiter_thread = {
         let (output, terminator) = (output.clone(), terminator.clone());
-        let mut child = child;
         move || {
-            let code = child.wait().ok().map(|status| status.exit_code());
-            *terminator.exit.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+            while !terminator.poll() {
+                thread::sleep(EXIT_POLL);
+            }
             // Let the reader take everything the program printed; only a reader idle in a read
             // (a background job keeping the terminal open) stops the session from ending.
             loop {
@@ -195,7 +246,7 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
         }
     };
     let pty = LocalPty {
-        master: Mutex::new(pair.master),
+        master,
         terminator,
         output,
     };
@@ -208,7 +259,8 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
             .spawn(waiter_thread)
             .is_ok();
     if !started {
-        // Dropping `pty` hangs up and, if needed, kills the program.
+        pty.output.close();
+        pty.terminator.reap_now();
         return Err(PtyError("could not start the terminal's threads".into()));
     }
     Ok((pty, writer))
@@ -277,6 +329,11 @@ impl LocalPty {
     /// The exit code once the process ended (`Some(None)` when the system gave none).
     pub fn exit_code(&self) -> Option<Option<u32>> {
         *self.terminator.exit.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The shell's process id, when the system gives one.
+    pub fn pid(&self) -> Option<u32> {
+        self.terminator.pid
     }
 
     /// The working folder of the shell (not of a program it runs), when the system can tell.

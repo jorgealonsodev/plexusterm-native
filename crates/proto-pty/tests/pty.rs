@@ -302,12 +302,81 @@ fn a_program_that_ignores_the_hang_up_is_killed() {
 }
 
 #[test]
-fn dropping_the_terminal_ends_its_stream_even_when_nobody_reads() {
+fn dropping_the_terminal_ends_its_stream_and_its_process_even_when_nobody_reads() {
     let ring = ByteRing::new(64);
     let (pty, _w) = spawn(sh("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx'; done"), ring.clone()).unwrap();
     std::thread::sleep(Duration::from_millis(100));
+    let pid = pty.pid().expect("a pid");
     drop(pty);
     assert!(ring_closed(&ring));
+    assert!(
+        gone_within(pid, Duration::from_secs(5)),
+        "process {pid} still running after drop"
+    );
+}
+
+/// Whether `pid` disappeared (or became a zombie nobody else will reap) within `limit`.
+fn gone_within(pid: u32, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => return true,
+            Ok(stat)
+                if stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z')) =>
+            {
+                return true;
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn killing_also_ends_a_foreground_job_that_ignores_the_hang_up() {
+    // The job runs in its own process group (job control), so killing the shell's group alone misses it.
+    let spec = SpawnSpec {
+        program: Some("/bin/bash".into()),
+        args: vec![
+            "--norc".into(),
+            "-i".into(),
+            "-c".into(),
+            "trap '' HUP; sh -c 'trap \"\" HUP; printf JOB:$$; while :; do sleep 1; done'; true".into(),
+        ],
+        columns: 80,
+        rows: 24,
+        ..SpawnSpec::default()
+    };
+    let (pty, _w, ring) = start(spec);
+    let out = read_until(&ring, "JOB:");
+    let job: u32 = {
+        let mut text = out;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let tail = text.rsplit("JOB:").next().unwrap_or("");
+            let number: String = tail.chars().take_while(char::is_ascii_digit).collect();
+            if !number.is_empty() && tail.len() > number.len() {
+                break number.parse().unwrap();
+            }
+            assert!(Instant::now() < deadline, "no job pid in {text:?}");
+            std::thread::sleep(Duration::from_millis(20));
+            if let Some(bytes) = ring.try_pop(4096) {
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            } else if !number.is_empty() {
+                break number.parse().unwrap();
+            }
+        }
+    };
+    pty.kill();
+    wait_for_exit(&pty);
+    assert!(
+        gone_within(job, Duration::from_secs(5)),
+        "foreground job {job} survived"
+    );
 }
 
 #[test]
