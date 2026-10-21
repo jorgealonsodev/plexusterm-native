@@ -25,6 +25,8 @@
 //! [`ShellResize`], the `output` writer and `on_resize` hook of a [`term_engine::Session`].
 
 pub mod cwd;
+#[cfg(test)]
+mod interop_tests;
 pub mod platform;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_server;
