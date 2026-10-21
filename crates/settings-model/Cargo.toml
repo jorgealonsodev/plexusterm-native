@@ -1,0 +1,19 @@
+[package]
+name = "settings-model"
+description = "settings.json, keyboard shortcuts and the terminal font catalogue, compatible with PlexusTerm v0.2.15 (PRD SET-1..SET-4, KEY-1..KEY-5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-storage = { path = "../core-storage" }
+serde = "1"
+serde_json = "=1.0.154"
+ui-theme = { path = "../ui-theme" }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true
