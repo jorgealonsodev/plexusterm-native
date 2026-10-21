@@ -15,15 +15,21 @@
 
 pub mod assets;
 pub mod button;
+pub mod dialog;
+pub mod help_tip;
 pub mod logic;
+pub mod menu;
 pub mod text_input;
 pub mod theme;
 pub mod toggle;
 
 pub use assets::{Assets, Icon};
 pub use button::Button;
+pub use dialog::{Dialog, DialogEvent};
+pub use help_tip::HelpTip;
 pub use logic::button::ButtonKind;
 pub use logic::dialog::DialogWidth;
+pub use menu::{ContextMenu, DropdownMenu, Menu, MenuEntry, MenuEvent, MenuItem};
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{Elevation, Radius, TextSize, Theme};
 pub use toggle::{Checkbox, Radio};
