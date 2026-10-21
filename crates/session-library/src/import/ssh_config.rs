@@ -59,18 +59,36 @@ fn first_argument(value: &str) -> &str {
     value.split(is_js_space).next().unwrap_or("")
 }
 
-/// Case-insensitive glob with `*` and `?`.
+/// Case-insensitive glob with `*` and `?`. Iterative, without recursion: a crafted config
+/// cannot overflow the stack, and a star only ever resumes after the latest star, so the work is
+/// at most pattern length × text length.
 fn glob_matches(pattern: &[char], text: &[char]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some(('*', rest)) => (0..=text.len()).any(|skip| text.get(skip..).is_some_and(|t| glob_matches(rest, t))),
-        Some((p, rest)) => match text.split_first() {
-            Some((t, text_rest)) => {
-                (*p == '?' || p.to_lowercase().eq(t.to_lowercase())) && glob_matches(rest, text_rest)
+    let same = |p: char, t: char| p == '?' || p.to_lowercase().eq(t.to_lowercase());
+    let (mut p, mut t) = (0, 0);
+    // The latest star and the text position it is currently matched up to.
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match (pattern.get(p), text.get(t)) {
+            (Some('*'), _) => {
+                star = Some((p, t));
+                p += 1;
             }
-            None => false,
-        },
+            (Some(&pc), Some(&tc)) if same(pc, tc) => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                // Let the latest star take one more character and retry after it.
+                Some((sp, st)) => {
+                    star = Some((sp, st + 1));
+                    p = sp + 1;
+                    t = st + 1;
+                }
+                None => return false,
+            },
+        }
     }
+    pattern.get(p..).is_some_and(|rest| rest.iter().all(|&c| c == '*'))
 }
 
 fn glob(pattern: &str, alias: &str) -> bool {
