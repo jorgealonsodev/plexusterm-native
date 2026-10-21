@@ -7,6 +7,7 @@
 
 pub mod file;
 pub mod form;
+pub mod import;
 pub mod jump_hosts;
 pub mod library;
 pub mod model;
