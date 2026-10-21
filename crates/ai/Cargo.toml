@@ -1,0 +1,25 @@
+[package]
+name = "ai"
+description = "AI command suggestions and the chat assistant (Anthropic, Gemini, OpenAI, OpenAI-compatible, OpenCode Go), ported from PlexusTerm v0.2.15 (PRD AI-1..AI-9)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-secrets = { path = "../core-secrets" }
+core-storage = { path = "../core-storage" }
+# Same versions as PlexusTerm v0.2.15's Cargo.lock; rustls only, no native TLS.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "json"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+tokio = { version = "=1.53.3", features = ["rt", "time", "sync", "macros"] }
+zeroize = "=1.9.1"
+
+[dev-dependencies]
+core-secrets = { path = "../core-secrets", features = ["test-support"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.3", features = ["rt", "time", "sync", "macros", "net", "io-util", "test-util"] }
+
+[lints]
+workspace = true
