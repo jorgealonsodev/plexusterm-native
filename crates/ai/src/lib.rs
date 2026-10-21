@@ -14,6 +14,8 @@ mod limiter;
 pub mod models;
 mod opencode;
 mod providers;
+#[cfg(test)]
+mod tests;
 mod text;
 
 use std::path::{Path, PathBuf};
@@ -217,6 +219,11 @@ fn keyring_error(err: SecretError) -> AiError {
 pub struct ApiKey(Zeroizing<String>);
 
 impl ApiKey {
+    #[cfg(test)]
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(Zeroizing::new(key.into()))
+    }
+
     fn expose(&self) -> &str {
         &self.0
     }
@@ -334,6 +341,13 @@ impl AiClient {
     /// `refresh` (or the cache is missing or old).
     pub async fn opencode_models(&self, refresh: bool) -> Result<opencode::GoModels, AiError> {
         self.go_models.list(&self.http, &self.endpoints, refresh).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeouts(mut self, complete: Duration, assist: Duration) -> Self {
+        self.complete_timeout = complete;
+        self.assist_timeout = assist;
+        self
     }
 
     pub async fn complete(
