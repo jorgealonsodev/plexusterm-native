@@ -28,6 +28,8 @@ pub mod cwd;
 pub mod platform;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_server;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -956,6 +958,24 @@ impl SshManager {
     /// Asks `prompt` about unknown host keys instead of failing with [`SshError::UnknownHost`].
     pub fn with_host_key_prompt(mut self, prompt: SharedPrompt) -> Self {
         self.prompt = Some(prompt);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_storage_timeout(mut self, timeout: Duration) -> Self {
+        self.storage_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_agent_socket(mut self, socket: PathBuf) -> Self {
+        self.agent_socket = Some(socket);
         self
     }
 
