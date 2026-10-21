@@ -6,6 +6,7 @@
 mod colors;
 mod grid;
 mod keys;
+mod latency;
 mod terminal;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px, size};
@@ -13,7 +14,18 @@ use ui_theme::{DEFAULT_SCHEME_ID, scheme_by_id, ui_tokens};
 
 use crate::terminal::{LocalSession, TerminalView};
 
+/// When `main` started, for the NFR-3 benchmark build.
+#[cfg(feature = "bench")]
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+#[cfg(feature = "bench")]
+fn started() -> std::time::Instant {
+    *STARTED.get_or_init(std::time::Instant::now)
+}
+
 fn main() {
+    #[cfg(feature = "bench")]
+    let _ = started();
     gpui_platform::application().run(|cx: &mut App| {
         let scheme = scheme_by_id(DEFAULT_SCHEME_ID);
         // The pane is painted on the interface `bg` token (TERM-2), which is the scheme background.

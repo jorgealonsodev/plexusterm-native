@@ -7,6 +7,7 @@ use std::cell::{Cell as StdCell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -21,6 +22,7 @@ use ui_theme::{Palette, Rgb};
 
 use crate::grid::{Grid, Row};
 use crate::keys::{KeyAction, Mods, encode};
+use crate::latency::LatencyLog;
 
 /// TERM-18 default family, then the M0 fallback (JetBrains Mono is not bundled yet).
 const FONT_FAMILIES: [&str; 2] = ["JetBrains Mono", "DejaVu Sans Mono"];
@@ -54,6 +56,10 @@ pub struct TerminalView {
     /// Last size asked of the session, so a pane resize is requested once.
     requested: Rc<StdCell<(u16, u16)>>,
     focus: FocusHandle,
+    /// TERM-17: `None` inside unless `PLEXUS_LATENCY_LOG` is set.
+    latency: Rc<RefCell<LatencyLog>>,
+    /// NFR-3 benchmark builds: quit once the first frame with the prompt has been submitted.
+    exit_after_prompt: Option<Instant>,
     _pump: Task<()>,
 }
 
@@ -161,6 +167,8 @@ impl TerminalView {
             shaped: Rc::default(),
             requested: Rc::new(StdCell::new((columns, rows))),
             focus,
+            latency: Rc::new(RefCell::new(LatencyLog::from_env())),
+            exit_after_prompt: exit_after_prompt(),
             _pump: pump,
         }
     }
@@ -169,6 +177,9 @@ impl TerminalView {
     fn sync(&mut self) {
         if let Some(frame) = self.session.snapshot() {
             self.grid.borrow_mut().apply(&frame, &self.palette);
+            if !frame.lines.is_empty() {
+                self.latency.borrow_mut().output();
+            }
         }
     }
 
@@ -184,7 +195,9 @@ impl TerminalView {
         match encode(&keystroke.key, keystroke.key_char.as_deref(), mods) {
             KeyAction::Send(bytes) => {
                 // A full queue means the program is not reading; the key is dropped, never waited on.
-                let _ = self.session.write(&bytes);
+                if self.session.write(&bytes).is_ok() {
+                    self.latency.borrow_mut().key(bytes.len());
+                }
             }
             KeyAction::Paste => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -287,6 +300,7 @@ impl Render for TerminalView {
         let cursor_color = hsla(self.palette.cursor);
         let (grid, shaped, requested) = (self.grid.clone(), self.shaped.clone(), self.requested.clone());
         let (session, font, cell) = (self.session.clone(), self.font.clone(), self.cell);
+        let (latency, exit_after_prompt) = (self.latency.clone(), self.exit_after_prompt);
 
         let prepaint = {
             let grid = grid.clone();
@@ -335,6 +349,26 @@ impl Render for TerminalView {
                     cursor_color,
                 ));
             }
+            let painted = latency.borrow_mut().painted();
+            let quit_after =
+                exit_after_prompt.filter(|_| grid.borrow().rows.iter().any(|row| !row.text.trim().is_empty()));
+            if painted.is_some() || quit_after.is_some() {
+                // Runs once this frame callback, and with it the present call, has returned.
+                cx.spawn(async move |cx| {
+                    let submitted = Instant::now();
+                    if let Some(painted) = painted {
+                        latency.borrow_mut().submitted(painted, submitted);
+                    }
+                    if let Some(started) = quit_after {
+                        eprintln!(
+                            "plexusterm: first prompt frame submitted {} µs after start",
+                            submitted.saturating_duration_since(started).as_micros()
+                        );
+                        cx.update(|cx| cx.quit());
+                    }
+                })
+                .detach();
+            }
         };
 
         div()
@@ -345,4 +379,18 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .child(canvas(prepaint, paint).size_full())
     }
+}
+
+/// `PLEXUS_EXIT_AFTER_FIRST_PROMPT=1`, honoured only by builds with the `bench` feature (PRD §10,
+/// §4.1 row 10). The time printed counts from the start of `main`; the process start is
+/// measured from outside.
+#[cfg(feature = "bench")]
+fn exit_after_prompt() -> Option<Instant> {
+    (std::env::var_os("PLEXUS_EXIT_AFTER_FIRST_PROMPT").as_deref() == Some(std::ffi::OsStr::new("1")))
+        .then(crate::started)
+}
+
+#[cfg(not(feature = "bench"))]
+fn exit_after_prompt() -> Option<Instant> {
+    None
 }

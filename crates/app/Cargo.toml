@@ -20,6 +20,10 @@ proto-pty = { path = "../proto-pty" }
 term-engine = { path = "../term-engine" }
 ui-theme = { path = "../ui-theme" }
 
+[features]
+# Benchmark builds only (PRD §10, §4.1 row 10): honours `PLEXUS_EXIT_AFTER_FIRST_PROMPT=1`.
+bench = []
+
 [lints]
 workspace = true
 
