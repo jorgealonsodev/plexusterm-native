@@ -26,6 +26,8 @@
 
 pub mod cwd;
 pub mod platform;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_server;
 
 use std::collections::HashMap;
 use std::future::Future;
