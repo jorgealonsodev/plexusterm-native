@@ -383,3 +383,41 @@ async fn compare_without_a_diff_tool_says_what_to_install() {
         .unwrap_err();
     assert_eq!(err.to_string(), "cannot compare with \"-o\": choose a local file");
 }
+
+/// A failed upload must leave the remote original whole: v0.2.15 parity bug fixed natively.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_upload_never_destroys_the_remote_original() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("etc")).unwrap();
+    std::fs::write(root.path().join("etc/app.conf"), b"original").unwrap();
+    let (sftp, _conn) = common::session(root.path()).await;
+    // A directory opens but cannot be read, so the copy fails midway.
+    let unreadable = tempfile::tempdir().unwrap();
+    assert!(upload_file(&sftp, unreadable.path(), "/etc/app.conf").await.is_err());
+    assert_eq!(std::fs::read(root.path().join("etc/app.conf")).unwrap(), b"original");
+    let names: Vec<_> = std::fs::read_dir(root.path().join("etc"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["app.conf"], "no partial upload is left behind");
+}
+
+#[tokio::test]
+async fn an_upload_replaces_the_file_and_leaves_nothing_else_behind() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), b"old").unwrap();
+    let (sftp, _conn) = common::session(root.path()).await;
+    let local = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(local.path(), b"new").unwrap();
+    upload_file(&sftp, local.path(), "/a.txt").await.unwrap();
+    upload_file(&sftp, local.path(), "/b.txt").await.unwrap();
+    assert_eq!(std::fs::read(root.path().join("a.txt")).unwrap(), b"new");
+    assert_eq!(std::fs::read(root.path().join("b.txt")).unwrap(), b"new");
+    let mut names: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b.txt"]);
+}
