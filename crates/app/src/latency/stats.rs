@@ -105,8 +105,42 @@ pub fn parse_report_args(args: &[String]) -> Result<(std::path::PathBuf, Option<
     }
 }
 
+/// The two logs of a report folder, `None` for one that could not be read. A missing log reads
+/// as empty, but a folder with neither is an error, so a mistyped folder never reports success.
+pub fn require_logs(
+    folder: &std::path::Path,
+    keys: Option<String>,
+    frames: Option<String>,
+) -> Result<(String, String), String> {
+    if keys.is_none() && frames.is_none() {
+        return Err(format!(
+            "latency_report: neither keys.log nor frames.log can be read in {}",
+            folder.display()
+        ));
+    }
+    Ok((keys.unwrap_or_default(), frames.unwrap_or_default()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_folder_without_either_log_is_an_error() {
+        let folder = std::path::Path::new("logs");
+        assert_eq!(
+            require_logs(folder, Some("K 1 1\n".to_owned()), None),
+            Ok(("K 1 1\n".to_owned(), String::new()))
+        );
+        assert_eq!(
+            require_logs(folder, None, Some("1 0\n".to_owned())),
+            Ok((String::new(), "1 0\n".to_owned()))
+        );
+        let error = require_logs(folder, None, None).unwrap_err();
+        assert!(
+            error.contains("keys.log") && error.contains("frames.log") && error.contains("logs"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn report_arguments_take_a_folder_and_an_optional_whole_window() {
         let args = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();

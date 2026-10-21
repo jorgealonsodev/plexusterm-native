@@ -25,6 +25,8 @@ use term_engine::{ByteRing, EndReason, Session, SessionConfig, SessionHooks, Ses
 const TOTAL: usize = 100 * 1024 * 1024;
 const BLOCK: usize = 1024 * 1024;
 const END_MARK: &str = "END-OF-CORPUS";
+/// Far above the ~2 s the run takes in release; a stuck run fails instead of hanging.
+const DEADLINE: Duration = Duration::from_secs(300);
 
 /// About one MiB of mixed output; `seed` varies colours and positions between blocks.
 fn block(seed: usize) -> Vec<u8> {
@@ -72,8 +74,32 @@ fn corpus_blocks() -> impl Iterator<Item = Vec<u8>> {
     (0..TOTAL / BLOCK).map(block)
 }
 
+/// Closes the ring when the producer ends, also by panicking, so the parser sees the end of the
+/// stream and the test fails instead of waiting for a source that will never write again.
+struct CloseOnDrop(ByteRing);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 fn micros(d: Duration) -> u128 {
     d.as_micros()
+}
+
+#[test]
+fn a_producer_that_panics_still_closes_the_ring() {
+    let ring = ByteRing::new(1024);
+    let producer = thread::spawn({
+        let guard = CloseOnDrop(ring.clone());
+        move || {
+            let _guard = guard;
+            panic!("producer failed");
+        }
+    });
+    assert!(producer.join().is_err());
+    assert!(ring.is_closed());
 }
 
 #[test]
@@ -107,7 +133,9 @@ fn feeds_100_mib_of_mixed_output() {
     let started = Instant::now();
     let producer = thread::spawn({
         let ring = ring.clone();
+        let guard = CloseOnDrop(ring.clone());
         move || {
+            let _guard = guard;
             for bytes in blocks {
                 for chunk in bytes.chunks(64 * 1024) {
                     // Blocks while the ring is full (ST-3 backpressure): never dropped.
@@ -123,6 +151,10 @@ fn feeds_100_mib_of_mixed_output() {
     let mut waits: Vec<u128> = Vec::new();
     let mut frames = 0_usize;
     while session.state() == SessionState::Running {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "the session did not end within {DEADLINE:?}"
+        );
         let asked = Instant::now();
         if session.snapshot().is_some() {
             frames += 1;
@@ -131,7 +163,10 @@ fn feeds_100_mib_of_mixed_output() {
         thread::sleep(Duration::from_millis(1));
     }
     let elapsed = started.elapsed();
-    producer.join().unwrap();
+    // A producer that panicked closed the ring on its way out; its panic fails the test here.
+    if let Err(panic) = producer.join() {
+        std::panic::resume_unwind(panic);
+    }
 
     assert_eq!(session.state(), SessionState::Ended(EndReason::SourceClosed));
     let screen = session.full_frame();

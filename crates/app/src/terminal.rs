@@ -12,7 +12,7 @@ use std::time::Instant;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, Bounds, Context, FocusHandle, Font, FontStyle, FontWeight, Hsla, KeyDownEvent, Pixels, Rgba, ShapedLine,
+    App, Bounds, Context, FocusHandle, Font, FontStyle, FontWeight, Hsla, KeyDownEvent, Pixels, Rgba, ShapedLine, Size,
     StrikethroughStyle, Task, TextAlign, TextRun, UnderlineStyle, Window, canvas, div, fill, font, point, prelude::*,
     px, size,
 };
@@ -60,6 +60,8 @@ pub struct TerminalView {
     latency: Rc<RefCell<LatencyLog>>,
     /// NFR-3 benchmark builds: quit once the first frame with the prompt has been submitted.
     exit_after_prompt: Option<Instant>,
+    /// Whether the pane has painted before (its first paint is never presented by its own draw).
+    painted_before: Rc<StdCell<bool>>,
     _pump: Task<()>,
 }
 
@@ -77,7 +79,8 @@ pub struct LocalSession {
 }
 
 impl LocalSession {
-    /// Spawns the user's shell on a PTY and starts its session (ST-7: before the window exists).
+    /// Spawns the user's shell on a PTY and starts its session (ST-7: before GPUI starts, so the
+    /// shell's startup overlaps the GPU and window setup).
     pub fn start() -> Result<Self, StartError> {
         let (columns, rows) = (80, 24);
         let ring = ByteRing::new(ByteRing::SESSION_CAPACITY);
@@ -136,6 +139,7 @@ impl TerminalView {
         } = local;
         let pump = cx.spawn(async move |this, cx| {
             while wakes.next().await.is_some() {
+                crate::startup::mark("first_wake");
                 pending.store(false, Ordering::Release);
                 let running = this.update(cx, |view, cx| {
                     if view.session.state() == SessionState::Running {
@@ -153,8 +157,17 @@ impl TerminalView {
             }
         });
 
+        crate::startup::mark("view_new");
         let font = pick_font(window);
+        crate::startup::mark("font_picked");
         let cell = measure(&font, window);
+        crate::startup::mark("font_measured");
+        // The shell was spawned at 80×24 before the font was known; asking for the real size now
+        // means the first frame already has it, instead of a resize and a second frame.
+        let initial = initial_grid(window.viewport_size(), cell);
+        if initial != (columns, rows) {
+            session.request_resize(initial.0, initial.1);
+        }
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         Self {
@@ -165,19 +178,25 @@ impl TerminalView {
             cell,
             grid: Rc::default(),
             shaped: Rc::default(),
-            requested: Rc::new(StdCell::new((columns, rows))),
+            requested: Rc::new(StdCell::new(initial)),
             focus,
             latency: Rc::new(RefCell::new(LatencyLog::from_env())),
             exit_after_prompt: exit_after_prompt(),
+            painted_before: Rc::default(),
             _pump: pump,
         }
     }
 
     /// Copies what changed since the last frame into the row cache (the only lock the UI takes).
+    ///
+    /// TERM-17 attribution: any damaged output that reaches the view while keys are waiting counts
+    /// as the echo of all of them, whatever produced it (a prompt redraw, a clock); output that
+    /// arrives while no key is waiting is not attributed to any key ([`LatencyLog::output`]).
     fn sync(&mut self) {
         if let Some(frame) = self.session.snapshot() {
             self.grid.borrow_mut().apply(&frame, &self.palette);
             if !frame.lines.is_empty() {
+                crate::startup::mark("first_output_in_view");
                 self.latency.borrow_mut().output();
             }
         }
@@ -278,6 +297,17 @@ fn text_runs(row: &Row, base: &Font) -> Vec<TextRun> {
         .collect()
 }
 
+/// Columns and rows of the pane in a window whose content area is `viewport`: the canvas fills
+/// the root `div` inside its [`PADDING`] on every side.
+fn initial_grid(viewport: Size<Pixels>, cell: CellSize) -> (u16, u16) {
+    let inset = px(2.0 * PADDING);
+    let content = size(
+        (viewport.width - inset).max(px(0.0)),
+        (viewport.height - inset).max(px(0.0)),
+    );
+    fit(Bounds::new(point(px(PADDING), px(PADDING)), content), cell)
+}
+
 /// Rows and columns that fit in `bounds` (at least one of each).
 fn fit(bounds: Bounds<Pixels>, cell: CellSize) -> (u16, u16) {
     let count = |space: Pixels, step: Pixels| {
@@ -295,12 +325,14 @@ fn fit(bounds: Bounds<Pixels>, cell: CellSize) -> (u16, u16) {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::startup::mark("first_render");
         self.sync();
         let bg = hsla(self.palette.background);
         let cursor_color = hsla(self.palette.cursor);
         let (grid, shaped, requested) = (self.grid.clone(), self.shaped.clone(), self.requested.clone());
         let (session, font, cell) = (self.session.clone(), self.font.clone(), self.cell);
         let (latency, exit_after_prompt) = (self.latency.clone(), self.exit_after_prompt);
+        let painted_before = self.painted_before.clone();
 
         let prepaint = {
             let grid = grid.clone();
@@ -312,6 +344,7 @@ impl Render for TerminalView {
                     requested.set(fits);
                     session.request_resize(fits.0, fits.1);
                     window.refresh();
+                    crate::startup::mark("resize_refresh");
                 }
                 // ST-4: shape only rows whose version changed since they were last shaped.
                 let grid = grid.borrow();
@@ -333,6 +366,7 @@ impl Render for TerminalView {
             }
         };
         let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, cx: &mut App| {
+            crate::startup::mark("first_paint");
             let shaped = shaped.borrow();
             for (index, slot) in shaped.iter().enumerate() {
                 let Some((_, line)) = slot else { continue };
@@ -349,25 +383,38 @@ impl Render for TerminalView {
                     cursor_color,
                 ));
             }
+            crate::startup::mark("first_paint_done");
             let painted = latency.borrow_mut().painted();
             let quit_after =
                 exit_after_prompt.filter(|_| grid.borrow().rows.iter().any(|row| !row.text.trim().is_empty()));
-            if painted.is_some() || quit_after.is_some() {
-                // Runs once this frame callback, and with it the present call, has returned.
-                cx.spawn(async move |cx| {
-                    let submitted = Instant::now();
-                    if let Some(painted) = painted {
-                        latency.borrow_mut().submitted(painted, submitted);
-                    }
-                    if let Some(started) = quit_after {
-                        eprintln!(
-                            "plexusterm: first prompt frame submitted {} µs after start",
-                            submitted.saturating_duration_since(started).as_micros()
-                        );
-                        cx.update(|cx| cx.quit());
-                    }
-                })
-                .detach();
+            // GPUI's `open_window` draws once without presenting, and that is always the view's
+            // first paint; the first frame callback then presents that scene. A paint inside a
+            // frame callback is presented by the same callback.
+            let presented_by_this_callback = painted_before.replace(true);
+            if painted.is_some() || quit_after.is_some() || exit_after_prompt.is_some() {
+                // Runs once the callback that presents this paint has returned.
+                let report = move |cx: &mut App| {
+                    cx.spawn(async move |cx| {
+                        let submitted = Instant::now();
+                        crate::startup::mark("first_frame_submitted");
+                        if let Some(painted) = painted {
+                            latency.borrow_mut().submitted(painted, submitted);
+                        }
+                        if let Some(started) = quit_after {
+                            eprintln!(
+                                "plexusterm: first prompt frame submitted {} µs after start",
+                                submitted.saturating_duration_since(started).as_micros()
+                            );
+                            cx.update(|cx| cx.quit());
+                        }
+                    })
+                    .detach();
+                };
+                if presented_by_this_callback {
+                    report(cx);
+                } else {
+                    window.on_next_frame(move |_, cx| report(cx));
+                }
             }
         };
 
@@ -386,11 +433,30 @@ impl Render for TerminalView {
 /// measured from outside.
 #[cfg(feature = "bench")]
 fn exit_after_prompt() -> Option<Instant> {
-    (std::env::var_os("PLEXUS_EXIT_AFTER_FIRST_PROMPT").as_deref() == Some(std::ffi::OsStr::new("1")))
-        .then(crate::started)
+    crate::startup::enabled().then(crate::startup::started)
 }
 
 #[cfg(not(feature = "bench"))]
 fn exit_after_prompt() -> Option<Instant> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_grid_fits_the_canvas_inside_the_padding() {
+        let cell = CellSize {
+            width: px(8.4),
+            height: px(17.0),
+        };
+        // 1200 - 2 * 6 = 1188 px / 8.4 = 141.4; 760 - 2 * 6 = 748 px / 17 = 44.
+        assert_eq!(initial_grid(size(px(1200.0), px(760.0)), cell), (141, 44));
+        // The same answer as the paint-time fit of the padded bounds.
+        let bounds = Bounds::new(point(px(PADDING), px(PADDING)), size(px(1188.0), px(748.0)));
+        assert_eq!(fit(bounds, cell), (141, 44));
+        // Smaller than the padding still gives one cell.
+        assert_eq!(initial_grid(size(px(4.0), px(4.0)), cell), (1, 1));
+    }
 }

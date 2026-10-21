@@ -11,6 +11,12 @@
 //! renderer's draw and surface present) in the same call. The paint callback queues a foreground
 //! task, which the executor runs only after that frame callback returns, so the time it records
 //! is at or after the present call returned. It does not include compositor or scan-out time.
+//! Two GPUI draws are not followed by a present in the same call. The view's first paint happens
+//! in `open_window`, so the pane reports it from the next frame callback, which presents that
+//! scene. GPUI also draws a dirty window before dispatching a key, and a paint there is reported
+//! when the key callback returns, up to one refresh before the next frame callback presents it;
+//! such a key reads early. That needs an echo to reach the view between a frame and the next key,
+//! which the 80 ms typing gap of `docs/benchmarks/m0.md` rarely leaves; it was not counted.
 
 #[allow(
     dead_code,

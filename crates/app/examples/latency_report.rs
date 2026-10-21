@@ -3,7 +3,8 @@
 //! `cargo run -p plexusterm --example latency_report -- <folder> [<from µs> <to µs>]` prints the
 //! key latency percentiles of `keys.log` and the frame-interval percentiles of `frames.log`;
 //! with a window (µs since the epoch) only intervals that start and end inside it count, e.g.
-//! while a `cat` of a large file runs. The first frame (interval 0) never counts.
+//! while a `cat` of a large file runs. The first frame (interval 0) never counts. A folder with
+//! neither log exits with an error.
 
 use std::process::ExitCode;
 
@@ -11,7 +12,7 @@ use std::process::ExitCode;
 #[allow(dead_code, reason = "the line writers are used by the app, not by this report")]
 mod stats;
 
-use stats::{Summary, frame_intervals, key_latencies, parse_report_args, summarize};
+use stats::{Summary, frame_intervals, key_latencies, parse_report_args, require_logs, summarize};
 
 fn ms(us: u64) -> String {
     #[allow(clippy::cast_precision_loss, reason = "µs values are far below 2^52")]
@@ -42,12 +43,19 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let read = |name: &str| std::fs::read_to_string(folder.join(name)).unwrap_or_default();
+    let read = |name: &str| std::fs::read_to_string(folder.join(name)).ok();
+    let (keys_log, frames_log) = match require_logs(&folder, read("keys.log"), read("frames.log")) {
+        Ok(logs) => logs,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let mut keys = key_latencies(&read("keys.log"));
+    let mut keys = key_latencies(&keys_log);
     print("key_received -> frame_submitted", summarize(&mut keys), "");
 
-    let mut intervals: Vec<u64> = frame_intervals(&read("frames.log"))
+    let mut intervals: Vec<u64> = frame_intervals(&frames_log)
         .into_iter()
         .filter(|&(at, interval)| {
             interval > 0 && window.is_none_or(|(from, to)| at.saturating_sub(u128::from(interval)) >= from && at <= to)

@@ -7,6 +7,7 @@ mod colors;
 mod grid;
 mod keys;
 mod latency;
+mod startup;
 mod terminal;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px, size};
@@ -14,19 +15,23 @@ use ui_theme::{DEFAULT_SCHEME_ID, scheme_by_id, ui_tokens};
 
 use crate::terminal::{LocalSession, TerminalView};
 
-/// When `main` started, for the NFR-3 benchmark build.
-#[cfg(feature = "bench")]
-static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-#[cfg(feature = "bench")]
-fn started() -> std::time::Instant {
-    *STARTED.get_or_init(std::time::Instant::now)
-}
-
 fn main() {
-    #[cfg(feature = "bench")]
-    let _ = started();
-    gpui_platform::application().run(|cx: &mut App| {
+    startup::begin();
+    // ST-7: the shell starts first, so its own startup runs while GPUI and the GPU initialise.
+    let local = match LocalSession::start() {
+        Ok(local) => local,
+        Err(error) => {
+            // A local pane that cannot start closes like one whose shell ended (ST-8); it is the
+            // only pane, so the app ends.
+            eprintln!("plexusterm: could not start the terminal: {}", error.0);
+            return;
+        }
+    };
+    startup::mark("pty_spawned");
+    let application = gpui_platform::application();
+    startup::mark("app_created");
+    application.run(move |cx: &mut App| {
+        startup::mark("run_callback");
         let scheme = scheme_by_id(DEFAULT_SCHEME_ID);
         // The pane is painted on the interface `bg` token (TERM-2), which is the scheme background.
         let palette = scheme.palette;
@@ -42,19 +47,10 @@ fn main() {
             app_id: Some("plexusterm".to_owned()),
             ..WindowOptions::default()
         };
-        let local = match LocalSession::start() {
-            Ok(local) => local,
-            Err(error) => {
-                // A local pane that cannot start closes like one whose shell ended (ST-8); it is
-                // the only pane, so the app ends.
-                eprintln!("plexusterm: could not start the terminal: {}", error.0);
-                cx.quit();
-                return;
-            }
-        };
         let opened = cx.open_window(options, |window, cx| {
             cx.new(|cx| TerminalView::new(local, palette, window, cx))
         });
+        startup::mark("window_opened");
         if let Err(error) = opened {
             eprintln!("plexusterm: could not open the window: {error:#}");
             cx.quit();
