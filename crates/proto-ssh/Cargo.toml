@@ -1,0 +1,31 @@
+[package]
+name = "proto-ssh"
+description = "SSH shell sessions with OpenSSH-compatible host key checks, jump hosts and saved passwords, ported from PlexusTerm v0.2.15 (PRD SSH-1..SSH-6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The in-process SSH server other crates' tests connect to (SFTP, tunnels, Mosh).
+test-support = []
+
+[dependencies]
+core-secrets = { path = "../core-secrets" }
+term-engine = { path = "../term-engine" }
+# Same versions as PlexusTerm v0.2.15's Cargo.lock.
+russh = "=0.64.1"
+russh-sftp = "=3.0.1"
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.3", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+zeroize = "=1.9.1"
+
+[dev-dependencies]
+core-secrets = { path = "../core-secrets", features = ["test-support"] }
+rand = { version = "=0.10.3", default-features = false, features = ["sys_rng"] }
+serde_json = "=1.0.154"
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+
+[lints]
+workspace = true
