@@ -162,6 +162,9 @@ pub enum SshError {
     AuthFailed,
     #[error("no password is saved for this session")]
     SecretMissing,
+    /// The home folder is unknown (`HOME`/`USERPROFILE` unset or empty).
+    #[error("Cannot find your home folder, so the known hosts file is unknown.")]
+    NoHome,
     #[error("unknown terminal session {id}")]
     UnknownSession { id: u32 },
     #[error("{message}")]
@@ -678,10 +681,7 @@ async fn try_default_keys(
     let mut attempts = 0;
     let mut offered: Vec<PublicKey> = Vec::new();
 
-    // Tests only use an explicit agent socket, never the developer's own agent.
-    if (agent_socket.is_some() || !(cfg!(test) || cfg!(feature = "test-support")))
-        && let Ok(mut agent) = platform::connect_agent(agent_socket).await
-    {
+    if let Ok(mut agent) = platform::connect_agent(agent_socket).await {
         let identities = agent.request_identities().await.unwrap_or_default();
         for identity in identities {
             if attempts == MAX_DEFAULT_KEY_ATTEMPTS {
@@ -927,11 +927,12 @@ async fn push(ring: &ByteRing, data: &[u8]) -> Result<(), Closed> {
 
 pub struct SshManager {
     known_hosts: PathBuf,
-    /// Overrides `SSH_AUTH_SOCK` (used by tests).
+    /// Overrides `SSH_AUTH_SOCK` (see [`SshManager::with_agent_socket`]).
     agent_socket: Option<PathBuf>,
     secrets: SharedSecrets,
     storage_timeout: Duration,
     connect_timeout: Duration,
+    exec_timeout: Duration,
     prompt: Option<SharedPrompt>,
     next_id: AtomicU32,
     sessions: Mutex<HashMap<u32, SessionEntry>>,
@@ -945,6 +946,7 @@ impl SshManager {
             secrets: Arc::new(NoStore),
             storage_timeout: STORAGE_TIMEOUT,
             connect_timeout: CONNECT_TIMEOUT,
+            exec_timeout: EXEC_TIMEOUT,
             prompt: None,
             next_id: AtomicU32::new(0),
             sessions: Mutex::new(HashMap::new()),
@@ -975,9 +977,17 @@ impl SshManager {
         self
     }
 
-    #[cfg(all(test, unix))]
-    fn with_agent_socket(mut self, socket: PathBuf) -> Self {
-        self.agent_socket = Some(socket);
+    #[cfg(test)]
+    fn with_exec_timeout(mut self, timeout: Duration) -> Self {
+        self.exec_timeout = timeout;
+        self
+    }
+
+    /// Uses the SSH agent at `endpoint` (a Unix socket, or a named pipe on Windows) instead of
+    /// `SSH_AUTH_SOCK` or the Windows OpenSSH agent pipe. Tests pin it so the agent of the
+    /// environment never changes their logins.
+    pub fn with_agent_socket(mut self, endpoint: PathBuf) -> Self {
+        self.agent_socket = Some(endpoint);
         self
     }
 
@@ -994,9 +1004,15 @@ impl SshManager {
         }
     }
 
-    /// Uses the current user's `~/.ssh/known_hosts`, like OpenSSH.
-    pub fn for_current_user() -> Self {
-        Self::new(platform::known_hosts_path())
+    /// Uses the current user's `~/.ssh/known_hosts`, like OpenSSH. Fails with
+    /// [`SshError::NoHome`] when the home folder is unknown, instead of using a `known_hosts`
+    /// relative to the working folder.
+    pub fn for_current_user() -> Result<Self, SshError> {
+        Self::for_known_hosts(platform::known_hosts_path())
+    }
+
+    fn for_known_hosts(known_hosts: Option<PathBuf>) -> Result<Self, SshError> {
+        known_hosts.map(Self::new).ok_or(SshError::NoHome)
     }
 
     /// Connects without touching saved passwords (tests; the app uses `connect_with`).
@@ -1190,38 +1206,63 @@ impl SshManager {
 
     /// Runs `command` on session `id` over a new exec channel of its existing connection (no
     /// new login) and returns its stdout. Output beyond [`MAX_EXEC_OUTPUT`] is dropped; a
-    /// non-zero exit status or no answer within [`EXEC_TIMEOUT`] is an error.
+    /// non-zero exit status, an exit signal or no answer within [`EXEC_TIMEOUT`] is an error. A
+    /// command that does not answer in time has its channel closed, so it never keeps one of the
+    /// connection's limited sessions (OpenSSH `MaxSessions`, 10 by default).
     pub async fn exec(&self, id: u32, command: &str) -> Result<String, SshError> {
         let handle = self.entry(id, |entry| entry.handle.clone())?;
-        let run = async {
-            let mut channel = handle.channel_open_session().await.map_err(connection)?;
-            channel.exec(true, command).await.map_err(connection)?;
-            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-            let mut exit_status = None;
-            while let Some(message) = channel.wait().await {
-                match message {
-                    ChannelMsg::Data { data } => append_capped(&mut stdout, &data),
-                    ChannelMsg::ExtendedData { data, .. } => append_capped(&mut stderr, &data),
-                    ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
-                    ChannelMsg::Close => break,
-                    _ => {}
-                }
-            }
-            match exit_status {
-                Some(0) | None => Ok(String::from_utf8_lossy(&stdout).into_owned()),
-                Some(status) => Err(SshError::Connection {
-                    message: format!(
-                        "remote command failed (exit status {status}): {}",
-                        String::from_utf8_lossy(&stderr).trim()
-                    ),
-                }),
-            }
+        let timeout = self.exec_timeout;
+        let timed_out = || SshError::Connection {
+            message: format!("remote command did not finish within {timeout:?}"),
         };
-        tokio::time::timeout(EXEC_TIMEOUT, run).await.unwrap_or_else(|_| {
-            Err(SshError::Connection {
-                message: format!("remote command did not finish within {} s", EXEC_TIMEOUT.as_secs()),
-            })
-        })
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut channel = tokio::time::timeout_at(deadline, handle.channel_open_session())
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(connection)?;
+        match tokio::time::timeout_at(deadline, run_exec(&mut channel, command)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = channel.close().await;
+                Err(timed_out())
+            }
+        }
+    }
+}
+
+/// Runs `command` on the fresh session `channel` until the server closes it.
+async fn run_exec(channel: &mut Channel<client::Msg>, command: &str) -> Result<String, SshError> {
+    channel.exec(true, command).await.map_err(connection)?;
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let (mut exit_status, mut exit_signal) = (None, None);
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => append_capped(&mut stdout, &data),
+            ChannelMsg::ExtendedData { data, .. } => append_capped(&mut stderr, &data),
+            ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+            ChannelMsg::ExitSignal { signal_name, .. } => exit_signal = Some(signal_name),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    let failure = match (exit_status, exit_signal) {
+        (Some(0), _) | (None, None) => return Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        (Some(status), _) => format!("exit status {status}"),
+        (None, Some(signal)) => format!("killed by signal {}", signal_name(&signal)),
+    };
+    Err(SshError::Connection {
+        message: format!(
+            "remote command failed ({failure}): {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ),
+    })
+}
+
+/// The signal's name without the `SIG` prefix, as OpenSSH sends it (`KILL`, `TERM`, ...).
+fn signal_name(signal: &russh::Sig) -> String {
+    match signal {
+        russh::Sig::Custom(name) => name.clone(),
+        other => format!("{other:?}"),
     }
 }
 

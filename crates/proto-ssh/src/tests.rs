@@ -57,11 +57,18 @@ fn fingerprint(key: &russh::keys::PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
 }
 
+/// A manager using `known_hosts` whose SSH agent is a missing socket next to it, so a
+/// developer's or CI's `SSH_AUTH_SOCK` never changes a test; agent tests set their own.
+pub(crate) fn manager(known_hosts: PathBuf) -> SshManager {
+    let no_agent = known_hosts.with_file_name("no-agent.sock");
+    SshManager::new(known_hosts).with_agent_socket(no_agent)
+}
+
 /// Manager whose known_hosts already trusts `key` for 127.0.0.1:`port`.
 fn trusting(dir: &tempfile::TempDir, port: u16, key: &russh::keys::PublicKey) -> SshManager {
     let path = dir.path().join("known_hosts");
     russh::keys::known_hosts::learn_known_hosts_path("127.0.0.1", port, key, &path).unwrap();
-    SshManager::new(path)
+    manager(path)
 }
 
 #[tokio::test]
@@ -123,7 +130,7 @@ async fn unknown_host_is_rejected_with_its_fingerprint_and_not_recorded() {
     let server = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("known_hosts");
-    let mgr = SshManager::new(path.clone());
+    let mgr = manager(path.clone());
     let out = ring();
 
     let err = mgr
@@ -153,7 +160,7 @@ async fn unknown_key_type_reports_the_key_types_already_known_for_the_host() {
     let path = dir.path().join("known_hosts");
     let port = server.addr.port();
     std::fs::write(&path, format!("[127.0.0.1]:{port} {ECDSA_HOST_KEY}\n")).unwrap();
-    let mgr = SshManager::new(path);
+    let mgr = manager(path);
     let out = ring();
 
     let err = mgr
@@ -219,37 +226,149 @@ fn write_key(path: &Path, key: &russh::keys::PrivateKey) {
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
 }
 
-/// An `ssh-agent` holding `key`, listening in `dir`; `None` when ssh-agent is not installed.
+/// A running `ssh-agent` listening on `socket`, killed when dropped (also when a test fails
+/// or setting it up fails half-way).
 #[cfg(unix)]
-async fn spawn_agent(dir: &tempfile::TempDir, key: &russh::keys::PrivateKey) -> Option<(std::process::Child, PathBuf)> {
-    if std::process::Command::new("ssh-agent").arg("-h").output().is_err() {
-        eprintln!("skipping: ssh-agent not installed");
-        return None;
+struct AgentProcess {
+    child: std::process::Child,
+    socket: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for AgentProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
-    let socket = dir.path().join("agent.sock");
-    let agent = std::process::Command::new("ssh-agent")
+}
+
+/// Starts an `ssh-agent` on `socket` and adds `key_file` to it; `Ok(None)` when ssh-agent is
+/// not installed.
+#[cfg(unix)]
+async fn start_agent(socket: &Path, key_file: &Path) -> Result<Option<AgentProcess>, String> {
+    if std::process::Command::new("ssh-agent").arg("-h").output().is_err() {
+        return Ok(None);
+    }
+    let child = std::process::Command::new("ssh-agent")
         .args(["-D", "-a"])
-        .arg(&socket)
+        .arg(socket)
         .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
-        .unwrap();
-    for _ in 0..50 {
-        if socket.exists() {
-            break;
+        .map_err(|err| format!("cannot start ssh-agent: {err}"))?;
+    let mut agent = AgentProcess {
+        child,
+        socket: socket.to_path_buf(),
+    };
+    let mut waited = 0;
+    while !socket.exists() {
+        let exited = agent.child.try_wait().ok().flatten().is_some();
+        if exited || waited == 50 {
+            return Err(format!("ssh-agent did not create its socket {}", socket.display()));
         }
+        waited += 1;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let added = std::process::Command::new("ssh-add")
+        .arg(key_file)
+        .env("SSH_AUTH_SOCK", socket)
+        .output()
+        .map_err(|err| format!("cannot run ssh-add: {err}"))?;
+    if !added.status.success() {
+        return Err(format!("ssh-add failed: {added:?}"));
+    }
+    Ok(Some(agent))
+}
+
+/// An `ssh-agent` holding `key`, listening in `dir`; `None` when ssh-agent is not installed.
+#[cfg(unix)]
+async fn spawn_agent(dir: &tempfile::TempDir, key: &russh::keys::PrivateKey) -> Option<AgentProcess> {
     // Outside `dir`, so it is never taken for a default identity file.
     let keys = tempfile::tempdir().unwrap();
     let key_path = keys.path().join("agent_key");
     write_key(&key_path, key);
-    let added = std::process::Command::new("ssh-add")
-        .arg(&key_path)
-        .env("SSH_AUTH_SOCK", &socket)
+    let agent = start_agent(&dir.path().join("agent.sock"), &key_path).await.unwrap();
+    if agent.is_none() {
+        eprintln!("skipping: ssh-agent not installed");
+    }
+    agent
+}
+
+/// Processes whose command line mentions `socket` (Linux `/proc`).
+#[cfg(target_os = "linux")]
+fn processes_using(socket: &Path) -> usize {
+    let needle = socket.as_os_str().as_encoded_bytes();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| std::fs::read(entry.ok()?.path().join("cmdline")).ok())
+        .filter(|cmdline| cmdline.windows(needle.len()).any(|window| window == needle))
+        .count()
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_failed_ssh_add_leaves_no_ssh_agent_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let result = start_agent(&socket, &dir.path().join("missing_key")).await;
+    match result {
+        Ok(None) => return,
+        Ok(Some(_)) => panic!("ssh-add of a missing key succeeded"),
+        Err(err) => assert!(err.contains("ssh-add failed"), "{err}"),
+    }
+    assert_eq!(processes_using(&socket), 0, "ssh-agent was left running");
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn an_agent_socket_that_never_appears_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // ssh-agent cannot create a socket in a missing folder.
+    let socket = dir.path().join("missing").join("agent.sock");
+    let result = start_agent(&socket, &dir.path().join("missing_key")).await;
+    match result {
+        Ok(None) => return,
+        Ok(Some(_)) => panic!("an agent without a socket was returned"),
+        Err(err) => assert!(err.contains("did not create its socket"), "{err}"),
+    }
+    assert_eq!(processes_using(&socket), 0, "ssh-agent was left running");
+}
+
+/// Run by [`tests_ignore_the_ssh_agent_of_the_environment`] with `SSH_AUTH_SOCK` pointing at
+/// an agent holding the key this server accepts; on its own it checks the plain case.
+#[tokio::test]
+async fn a_password_login_in_tests_offers_no_agent_key() {
+    let client_key = key_from_seed(9);
+    let server = test_server::start(1, Some(client_key.public_key().clone())).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = trusting(&dir, server.addr.port(), &server.host_key);
+    let out = ring();
+
+    mgr.connect(request(server.addr.port(), password(PASSWORD)), out.clone())
+        .await
+        .unwrap();
+    assert!(wait_for(&out, "welcome").await.contains("welcome"));
+    assert_eq!(server.publickey_attempts(), 0, "an agent key was offered");
+    assert_eq!(server.password_attempts(), 1);
+}
+
+/// A developer's or CI's `ssh-agent` must not change what the tests see.
+#[tokio::test]
+#[cfg(unix)]
+async fn tests_ignore_the_ssh_agent_of_the_environment() {
+    let client_key = key_from_seed(9);
+    let dir = tempfile::tempdir().unwrap();
+    let Some(agent) = spawn_agent(&dir, &client_key).await else {
+        return;
+    };
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::a_password_login_in_tests_offers_no_agent_key"])
+        .env("SSH_AUTH_SOCK", &agent.socket)
         .output()
         .unwrap();
-    assert!(added.status.success(), "ssh-add failed: {added:?}");
-    Some((agent, socket))
+    drop(agent);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success() && stdout.contains("1 passed"), "{output:?}");
 }
 
 #[tokio::test]
@@ -258,17 +377,16 @@ async fn agent_login_uses_the_agent_identities() {
     let client_key = key_from_seed(9);
     let server = test_server::start(1, Some(client_key.public_key().clone())).await;
     let dir = tempfile::tempdir().unwrap();
-    let Some((mut agent, socket)) = spawn_agent(&dir, &client_key).await else {
+    let Some(agent) = spawn_agent(&dir, &client_key).await else {
         return;
     };
 
-    let mgr = trusting(&dir, server.addr.port(), &server.host_key).with_agent_socket(socket);
+    let mgr = trusting(&dir, server.addr.port(), &server.host_key).with_agent_socket(agent.socket.clone());
     let out = ring();
     let result = mgr
         .connect(request(server.addr.port(), SshAuth::Agent), out.clone())
         .await;
-    let _ = agent.kill();
-    let _ = agent.wait();
+    drop(agent);
     result.unwrap();
     assert!(wait_for(&out, "welcome").await.contains("welcome"));
 }
@@ -277,7 +395,7 @@ async fn agent_login_uses_the_agent_identities() {
 async fn trusting_the_fingerprint_connects_and_records_the_host() {
     let server = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = manager(dir.path().join("known_hosts"));
     let port = server.addr.port();
 
     let mut req = request(port, password(PASSWORD));
@@ -297,7 +415,7 @@ async fn trusting_the_fingerprint_connects_and_records_the_host() {
 async fn trusting_a_different_fingerprint_is_still_rejected() {
     let server = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = manager(dir.path().join("known_hosts"));
 
     let mut req = request(server.addr.port(), password(PASSWORD));
     req.trusted_fingerprint = Some("SHA256:not-the-real-one".into());
@@ -682,7 +800,7 @@ fn debug_of_stored_password_requests_never_contains_the_password() {
 #[tokio::test]
 async fn unreachable_host_is_a_connection_error() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = manager(dir.path().join("known_hosts"));
     // Bind and drop to get a port with nothing listening.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -735,7 +853,7 @@ async fn one_jump_host_reaches_the_final_shell() {
     let bastion = test_server::start(2, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target]));
+    let mgr = manager(trust_all(&dir, &[&bastion, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password(PASSWORD))];
     let out = ring();
@@ -754,7 +872,7 @@ async fn two_jump_hosts_reach_the_final_shell() {
     let second = test_server::start(3, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&first, &second, &target]));
+    let mgr = manager(trust_all(&dir, &[&first, &second, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![
         jump("first", &first, password(PASSWORD)),
@@ -775,7 +893,7 @@ async fn an_unknown_jump_host_names_the_hop_and_trusting_it_connects() {
     let bastion = test_server::start(2, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&target]));
+    let mgr = manager(trust_all(&dir, &[&target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password(PASSWORD))];
 
@@ -806,7 +924,7 @@ async fn an_unknown_target_behind_a_jump_host_is_not_wrapped() {
     let bastion = test_server::start(2, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion]));
+    let mgr = manager(trust_all(&dir, &[&bastion]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password(PASSWORD))];
 
@@ -824,7 +942,7 @@ async fn a_wrong_jump_password_names_the_hop_and_never_reaches_the_target() {
     let bastion = test_server::start(2, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target]));
+    let mgr = manager(trust_all(&dir, &[&bastion, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password("nope"))];
     let out = ring();
@@ -846,7 +964,7 @@ async fn a_failing_second_jump_names_its_position_and_closes_the_first() {
     let second = test_server::start(3, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&first, &second, &target]));
+    let mgr = manager(trust_all(&dir, &[&first, &second, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![
         jump("first", &first, password(PASSWORD)),
@@ -865,7 +983,7 @@ async fn stored_jump_passwords_are_bound_to_the_jump_endpoint() {
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target])).with_secrets(store.clone());
+    let mgr = manager(trust_all(&dir, &[&bastion, &target])).with_secrets(store.clone());
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, stored("j1"))];
 
@@ -896,7 +1014,7 @@ async fn remember_on_a_jump_host_saves_its_password_for_its_endpoint() {
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target])).with_secrets(store.clone());
+    let mgr = manager(trust_all(&dir, &[&bastion, &target])).with_secrets(store.clone());
     let mut req = request(target.addr.port(), password(PASSWORD));
     let mut bastion_hop = jump("bastion", &bastion, password(PASSWORD));
     bastion_hop.storage = remember("j1");
@@ -916,7 +1034,7 @@ async fn closing_a_chained_session_closes_every_hop() {
     let second = test_server::start(3, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&first, &second, &target]));
+    let mgr = manager(trust_all(&dir, &[&first, &second, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![
         jump("first", &first, password(PASSWORD)),
@@ -942,7 +1060,7 @@ async fn a_remote_exit_behind_jump_hosts_closes_every_hop() {
     let bastion = test_server::start(2, None).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target]));
+    let mgr = manager(trust_all(&dir, &[&bastion, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password(PASSWORD))];
     let out = ring();
@@ -963,7 +1081,7 @@ async fn sftp_works_over_a_chained_session() {
     let bastion = test_server::start(2, None).await;
     let target = test_server::start_with_sftp(root.path()).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target]));
+    let mgr = manager(trust_all(&dir, &[&bastion, &target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password(PASSWORD))];
     let out = ring();
@@ -987,7 +1105,7 @@ async fn sftp_works_over_a_chained_session() {
 async fn more_than_three_jump_hosts_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let target = test_server::start(1, None).await;
-    let mgr = SshManager::new(trust_all(&dir, &[&target]));
+    let mgr = manager(trust_all(&dir, &[&target]));
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("j", &target, password(PASSWORD)); MAX_JUMPS + 1];
     let out = ring();
@@ -1057,10 +1175,88 @@ async fn exec_reports_a_failing_command_with_its_stderr() {
     assert!(message.contains("nope: not found"), "{message}");
 }
 
+/// A password session on `server` and the manager holding it.
+async fn exec_session(server: &test_server::TestServer, dir: &tempfile::TempDir) -> (SshManager, u32) {
+    let mgr = trusting(dir, server.addr.port(), &server.host_key);
+    let out = ring();
+    let id = mgr
+        .connect(request(server.addr.port(), password(PASSWORD)), out.clone())
+        .await
+        .unwrap()
+        .id;
+    wait_for(&out, "welcome").await;
+    (mgr, id)
+}
+
+/// Waits up to 5 s for `server` to have no exec channel open.
+async fn wait_exec_channels_closed(server: &test_server::TestServer) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.open_exec_channels() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    server.open_exec_channels()
+}
+
+#[tokio::test]
+async fn exec_closes_its_channel_when_the_command_times_out() {
+    let server = test_server::start(1, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (mgr, id) = exec_session(&server, &dir).await;
+    let mgr = mgr.with_exec_timeout(Duration::from_millis(200));
+
+    let err = mgr.exec(id, "sleep-forever").await.unwrap_err();
+
+    assert!(err.to_string().contains("did not finish"), "{err}");
+    // OpenSSH allows 10 channels per connection: a timed-out command must not keep one.
+    assert_eq!(
+        wait_exec_channels_closed(&server).await,
+        0,
+        "the exec channel was left open"
+    );
+}
+
+#[tokio::test]
+async fn exec_reports_a_command_killed_by_a_signal_as_an_error() {
+    let server = test_server::start(1, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (mgr, id) = exec_session(&server, &dir).await;
+
+    let err = mgr.exec(id, "killed-by-signal").await.unwrap_err();
+
+    let message = err.to_string();
+    assert!(message.contains("signal KILL"), "{message}");
+}
+
+#[tokio::test]
+async fn exec_returns_canned_stdout_and_a_quiet_command_returns_nothing() {
+    let server = test_server::start(1, None).await;
+    server.reply_to_exec("hello", "hi\n");
+    let dir = tempfile::tempdir().unwrap();
+    let (mgr, id) = exec_session(&server, &dir).await;
+
+    assert_eq!(mgr.exec(id, "hello").await.unwrap(), "hi\n");
+    assert_eq!(mgr.exec(id, "true").await.unwrap(), "");
+}
+
+#[test]
+fn without_a_home_folder_there_is_no_known_hosts_file_and_no_manager() {
+    let err = SshManager::for_known_hosts(None)
+        .err()
+        .expect("no manager without a home");
+    assert!(matches!(err, SshError::NoHome), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "Cannot find your home folder, so the known hosts file is unknown."
+    );
+    let path = PathBuf::from("/home/me/.ssh/known_hosts");
+    let mgr = SshManager::for_known_hosts(Some(path.clone())).unwrap();
+    assert_eq!(mgr.context().known_hosts, path);
+}
+
 #[tokio::test]
 async fn exec_on_an_unknown_session_fails() {
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = manager(dir.path().join("known_hosts"));
     let err = mgr.exec(42, "true").await.unwrap_err();
     assert!(matches!(err, SshError::UnknownSession { id: 42 }), "{err:?}");
 }
@@ -1106,17 +1302,16 @@ async fn a_password_login_uses_an_accepted_agent_key_without_sending_the_passwor
     let client_key = key_from_seed(9);
     let server = test_server::start(1, Some(client_key.public_key().clone())).await;
     let dir = tempfile::tempdir().unwrap();
-    let Some((mut agent, socket)) = spawn_agent(&dir, &client_key).await else {
+    let Some(agent) = spawn_agent(&dir, &client_key).await else {
         return;
     };
-    let mgr = trusting(&dir, server.addr.port(), &server.host_key).with_agent_socket(socket);
+    let mgr = trusting(&dir, server.addr.port(), &server.host_key).with_agent_socket(agent.socket.clone());
     let out = ring();
 
     let result = mgr
         .connect(request(server.addr.port(), password("nope")), out.clone())
         .await;
-    let _ = agent.kill();
-    let _ = agent.wait();
+    drop(agent);
     result.unwrap();
     assert!(wait_for(&out, "welcome").await.contains("welcome"));
     assert_eq!(server.password_attempts(), 0, "the password was sent");
@@ -1266,7 +1461,7 @@ async fn a_password_jump_host_logs_in_with_a_default_key() {
     let bastion = test_server::start(2, Some(client_key.public_key().clone())).await;
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(trust_all(&dir, &[&bastion, &target]));
+    let mgr = manager(trust_all(&dir, &[&bastion, &target]));
     write_key(&dir.path().join("id_ed25519"), &client_key);
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password("nope"))];
@@ -1301,7 +1496,7 @@ async fn an_unknown_host_trusted_in_the_prompt_connects_and_is_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("known_hosts");
     let (yes, asked) = prompt(true, Duration::ZERO);
-    let mgr = SshManager::new(path.clone()).with_host_key_prompt(yes);
+    let mgr = manager(path.clone()).with_host_key_prompt(yes);
     let port = server.addr.port();
 
     let out = ring();
@@ -1321,7 +1516,7 @@ async fn an_unknown_host_trusted_in_the_prompt_connects_and_is_recorded() {
 
     // Recorded: a manager without a prompt now connects too.
     let out = ring();
-    let plain = SshManager::new(path);
+    let plain = manager(path);
     let _shell = plain
         .connect(request(port, password(PASSWORD)), out.clone())
         .await
@@ -1336,7 +1531,7 @@ async fn an_unknown_host_declined_in_the_prompt_is_unknown_host_and_not_recorded
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("known_hosts");
     let (no, asked) = prompt(false, Duration::ZERO);
-    let mgr = SshManager::new(path.clone()).with_host_key_prompt(no);
+    let mgr = manager(path.clone()).with_host_key_prompt(no);
 
     let err = mgr
         .connect(request(server.addr.port(), password(PASSWORD)), ring())
@@ -1369,7 +1564,7 @@ async fn the_prompt_names_the_jump_host_and_its_position() {
     let target = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
     let (yes, asked) = prompt(true, Duration::ZERO);
-    let mgr = SshManager::new(trust_all(&dir, &[&target])).with_host_key_prompt(yes);
+    let mgr = manager(trust_all(&dir, &[&target])).with_host_key_prompt(yes);
     let mut req = request(target.addr.port(), password(PASSWORD));
     req.jumps = vec![jump("bastion", &bastion, password(PASSWORD))];
 
@@ -1394,7 +1589,7 @@ async fn time_spent_in_the_prompt_does_not_count_toward_the_connect_timeout() {
     let server = test_server::start(1, None).await;
     let dir = tempfile::tempdir().unwrap();
     let (slow_yes, _) = prompt(true, Duration::from_millis(800));
-    let mgr = SshManager::new(dir.path().join("known_hosts"))
+    let mgr = manager(dir.path().join("known_hosts"))
         .with_host_key_prompt(slow_yes)
         .with_connect_timeout(Duration::from_millis(300));
 
@@ -1417,7 +1612,7 @@ async fn a_server_that_never_answers_times_out() {
         }
     });
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts")).with_connect_timeout(Duration::from_millis(300));
+    let mgr = manager(dir.path().join("known_hosts")).with_connect_timeout(Duration::from_millis(300));
 
     let err = tokio::time::timeout(
         Duration::from_secs(5),

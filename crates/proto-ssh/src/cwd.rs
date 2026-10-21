@@ -36,10 +36,15 @@ exit 0"
 /// parent pid and field 5 the controlling terminal (0 for none).
 pub const SHELL_CWD_COMMAND: &str = concat!("sh -c '", shell_cwd_script!(), "' 2>/dev/null");
 
-/// The folder printed by [`SHELL_CWD_COMMAND`], or `None` when it printed none.
+/// The folder printed by [`SHELL_CWD_COMMAND`], or `None` when it printed none. The script
+/// prints the folder last, so text that the user's rc files print before it is skipped: only
+/// the last non-empty line counts, and only when it is an absolute path.
 pub fn parse(output: &str) -> Option<String> {
-    let path = output.strip_suffix('\n').unwrap_or(output);
-    path.starts_with('/').then(|| path.to_string())
+    let last = output
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .rfind(|line| !line.is_empty())?;
+    last.starts_with('/').then(|| last.to_string())
 }
 
 /// The working folder of session `id`'s shell, or `None` when the server cannot tell.
@@ -55,6 +60,30 @@ mod tests {
     fn parses_the_printed_folder() {
         assert_eq!(parse("/home/u/src\n"), Some("/home/u/src".into()));
         assert_eq!(parse("/srv/my dir\n"), Some("/srv/my dir".into()));
+    }
+
+    #[test]
+    fn a_trailing_newline_is_not_part_of_the_folder() {
+        assert_eq!(parse("/srv/app\n"), Some("/srv/app".into()));
+        assert_eq!(parse("/srv/app"), Some("/srv/app".into()));
+        assert_eq!(parse("/srv/app\r\n"), Some("/srv/app".into()));
+    }
+
+    #[test]
+    fn a_relative_path_is_none() {
+        assert_eq!(parse("srv/app\n"), None);
+        assert_eq!(parse("~/src\n"), None);
+    }
+
+    /// Rc files of the remote user may print before the command's own output.
+    #[test]
+    fn rc_file_output_before_the_folder_is_skipped() {
+        assert_eq!(
+            parse("Welcome to the server\nLast login: today\n/home/u/src\n"),
+            Some("/home/u/src".into())
+        );
+        assert_eq!(parse("/etc/motd says hi\n/home/u/src\n\n"), Some("/home/u/src".into()));
+        assert_eq!(parse("/home/u/src\nbye from .bashrc\n"), None);
     }
 
     #[test]
@@ -79,8 +108,8 @@ mod tests {
         assert!(stdout.is_empty() || parse(&stdout).is_some(), "{stdout:?}");
     }
 
-    #[tokio::test]
-    async fn shell_cwd_runs_the_command_over_the_session() {
+    /// A password session on a fresh test server, its manager and the server.
+    async fn session() -> (crate::test_server::TestServer, SshManager, u32, tempfile::TempDir) {
         use crate::test_server::{self, PASSWORD};
         use crate::{ConnectRequest, SshAuth};
 
@@ -94,7 +123,7 @@ mod tests {
             &known_hosts,
         )
         .unwrap();
-        let ssh = SshManager::new(known_hosts);
+        let ssh = crate::tests::manager(known_hosts);
         let id = ssh
             .connect(
                 ConnectRequest {
@@ -114,9 +143,31 @@ mod tests {
             .await
             .unwrap()
             .id;
+        (server, ssh, id, dir)
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_runs_the_command_over_the_session() {
+        let (server, ssh, id, _dir) = session().await;
 
         // The fake server has no `sh`, so the command fails.
         assert!(shell_cwd(&ssh, id).await.is_err());
         assert_eq!(server.exec_commands(), vec![SHELL_CWD_COMMAND.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_returns_the_folder_the_server_prints() {
+        let (server, ssh, id, _dir) = session().await;
+        server.reply_to_exec(SHELL_CWD_COMMAND, "motd line\n/home/tester/src\n");
+
+        assert_eq!(shell_cwd(&ssh, id).await.unwrap(), Some("/home/tester/src".into()));
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_is_none_when_the_server_prints_nothing() {
+        let (server, ssh, id, _dir) = session().await;
+        server.reply_to_exec(SHELL_CWD_COMMAND, "");
+
+        assert_eq!(shell_cwd(&ssh, id).await.unwrap(), None);
     }
 }

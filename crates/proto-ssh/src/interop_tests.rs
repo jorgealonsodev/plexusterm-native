@@ -50,16 +50,19 @@ fn ring() -> ByteRing {
     ByteRing::new(ByteRing::SESSION_CAPACITY)
 }
 
+/// Collects output until `needle` appears or 10 s passed. Raw bytes are kept and decoded
+/// once, so a UTF-8 character split across two pops is not mangled.
 fn wait_for(out: &ByteRing, needle: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut text = String::new();
-    while Instant::now() < deadline && !text.contains(needle) {
+    let needle = needle.as_bytes();
+    let mut bytes = Vec::new();
+    while Instant::now() < deadline && !bytes.windows(needle.len()).any(|window| window == needle) {
         match out.try_pop(64 * 1024) {
-            Some(bytes) => text.push_str(&String::from_utf8_lossy(&bytes)),
+            Some(chunk) => bytes.extend_from_slice(&chunk),
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     }
-    text
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Trusts the server through the real unknown-host flow and returns a connected session.
@@ -82,7 +85,7 @@ async fn connect(t: &Target, mgr: &SshManager) -> (Shell, ByteRing) {
 async fn openssh_shell_resize_and_known_hosts() {
     let t = target();
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = super::tests::manager(dir.path().join("known_hosts"));
     let (shell, out) = connect(&t, &mgr).await;
     let id = shell.id;
 
@@ -107,7 +110,7 @@ async fn openssh_shell_resize_and_known_hosts() {
 async fn openssh_sftp_round_trip() {
     let t = target();
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = super::tests::manager(dir.path().join("known_hosts"));
     let (shell, _out) = connect(&t, &mgr).await;
     let session = mgr.sftp(shell.id).await.unwrap();
 
@@ -120,7 +123,10 @@ async fn openssh_sftp_round_trip() {
     session.create_dir(&work).await.unwrap();
 
     let payload: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i * 31 % 251) as u8).collect();
-    session.write(&remote, &payload).await.unwrap();
+    // `SftpSession::write` opens without CREATE, so a new file is created first.
+    let mut file = session.create(&remote).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut file, &payload).await.unwrap();
+    file.close().await.unwrap();
 
     let names: Vec<String> = session
         .read_dir(&work)
@@ -147,7 +153,7 @@ async fn openssh_through_a_jump_host() {
     // reached through a real OpenSSH `direct-tcpip` channel.
     let t = target();
     let dir = tempfile::tempdir().unwrap();
-    let mgr = SshManager::new(dir.path().join("known_hosts"));
+    let mgr = super::tests::manager(dir.path().join("known_hosts"));
     let auth = SshAuth::Key {
         path: t.key.clone(),
         passphrase: None,

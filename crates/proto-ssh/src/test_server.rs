@@ -13,9 +13,12 @@
 //! requested target, and `tcpip-forward` listens on the requested address and
 //! opens a `forwarded-tcpip` channel back to the client for every connection.
 //!
-//! Exec requests fake a remote shell running one command (see [`MOSH_CONNECT_REPLY`]):
-//! `mosh-server ...` prints a `MOSH CONNECT` line, `sleep-forever` never answers, `true`
-//! exits quietly, and anything else fails like a missing program (exit status 127).
+//! Exec requests fake a remote shell running one command (see [`MOSH_CONNECT_REPLY`]): a
+//! command given a canned reply with [`TestServer::reply_to_exec`] prints it and exits 0,
+//! `mosh-server ...` prints a `MOSH CONNECT` line, `sleep-forever` never answers,
+//! `killed-by-signal` ends with an exit signal and no exit status, `true` exits quietly, and
+//! anything else fails like a missing program (exit status 127). Exec channels the client has
+//! not closed yet are counted by [`TestServer::open_exec_channels`].
 //!
 //! Built for this crate's tests and, with the `test-support` feature, for other crates' tests.
 
@@ -60,9 +63,12 @@ pub struct TestServer {
     publickey_attempts: Arc<AtomicUsize>,
     /// Client connections currently open.
     open_connections: Arc<AtomicUsize>,
-    /// Commands received in exec requests, over every connection (read by the Unix-only
-    /// Mosh tests).
+    /// Commands received in exec requests, over every connection.
     exec_commands: Arc<Mutex<Vec<String>>>,
+    /// Canned stdout of exec commands, by exact command.
+    exec_replies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    /// Exec channels the client has not closed yet, over every connection.
+    open_exec_channels: Arc<AtomicUsize>,
 }
 
 impl TestServer {
@@ -80,6 +86,18 @@ impl TestServer {
 
     pub fn exec_commands(&self) -> Vec<String> {
         self.exec_commands.lock().unwrap().clone()
+    }
+
+    /// Makes the exec request `command` print `stdout` and exit with status 0.
+    pub fn reply_to_exec(&self, command: &str, stdout: &str) {
+        self.exec_replies
+            .lock()
+            .unwrap()
+            .insert(command.to_owned(), stdout.as_bytes().to_vec());
+    }
+
+    pub fn open_exec_channels(&self) -> usize {
+        self.open_exec_channels.load(Ordering::SeqCst)
     }
 }
 
@@ -108,6 +126,10 @@ struct Handler {
     publickey_attempts: Arc<AtomicUsize>,
     open_connections: Arc<AtomicUsize>,
     exec_commands: Arc<Mutex<Vec<String>>>,
+    exec_replies: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    open_exec_channels: Arc<AtomicUsize>,
+    /// Exec channels of this connection the client has not closed yet.
+    exec_channels: Arc<Mutex<HashSet<ChannelId>>>,
     _connection: Option<Arc<ConnectionGuard>>,
 }
 
@@ -154,12 +176,17 @@ async fn start_inner(
         publickey_attempts: Arc::default(),
         open_connections: Arc::default(),
         exec_commands: Arc::default(),
+        exec_replies: Arc::default(),
+        open_exec_channels: Arc::default(),
+        exec_channels: Arc::default(),
         _connection: None,
     };
     let password_attempts = server.password_attempts.clone();
     let publickey_attempts = server.publickey_attempts.clone();
     let open_connections = server.open_connections.clone();
     let exec_commands = server.exec_commands.clone();
+    let exec_replies = server.exec_replies.clone();
+    let open_exec_channels = server.open_exec_channels.clone();
     tokio::spawn(async move {
         let _ = server.run_on_socket(config, &socket).await;
     });
@@ -170,6 +197,8 @@ async fn start_inner(
         publickey_attempts,
         open_connections,
         exec_commands,
+        exec_replies,
+        open_exec_channels,
     }
 }
 
@@ -181,6 +210,7 @@ impl russh::server::Server for Handler {
             channels: Arc::default(),
             stream_channels: Arc::default(),
             forwards: Arc::default(),
+            exec_channels: Arc::default(),
             _connection: Some(Arc::new(ConnectionGuard(self.open_connections.clone()))),
             ..self.clone()
         }
@@ -341,13 +371,28 @@ impl russh::server::Handler for Handler {
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
         self.exec_commands.lock().unwrap().push(command.clone());
+        if self.exec_channels.lock().unwrap().insert(channel) {
+            self.open_exec_channels.fetch_add(1, Ordering::SeqCst);
+        }
         // Exec channels are not echoed.
         self.stream_channels.lock().unwrap().insert(channel);
         self.channels.lock().unwrap().remove(&channel);
         session.channel_success(channel)?;
+        let reply = self.exec_replies.lock().unwrap().get(&command).cloned();
+        if let Some(stdout) = reply {
+            session.data(channel, stdout)?;
+            session.exit_status_request(channel, 0)?;
+            session.eof(channel)?;
+            return session.close(channel);
+        }
         let program = command.split_whitespace().next().unwrap_or_default();
         let status = match program {
             "sleep-forever" => return Ok(()),
+            "killed-by-signal" => {
+                session.exit_signal_request(channel, russh::Sig::KILL, false, "", "en")?;
+                session.eof(channel)?;
+                return session.close(channel);
+            }
             "mosh-server" => {
                 session.data(channel, MOSH_CONNECT_REPLY.as_bytes().to_vec())?;
                 0
@@ -362,6 +407,13 @@ impl russh::server::Handler for Handler {
         session.exit_status_request(channel, status)?;
         session.eof(channel)?;
         session.close(channel)
+    }
+
+    async fn channel_close(&mut self, channel: ChannelId, _session: &mut Session) -> Result<(), Self::Error> {
+        if self.exec_channels.lock().unwrap().remove(&channel) {
+            self.open_exec_channels.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     async fn window_change_request(

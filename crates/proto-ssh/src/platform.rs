@@ -28,13 +28,19 @@ fn env(name: &str) -> Option<OsString> {
     std::env::var_os(name)
 }
 
-/// The user's home directory: `$HOME` on Unix, `%USERPROFILE%` on Windows.
+/// Reads one environment variable, treating an empty value as unset (like OpenSSH).
+fn non_empty(env: EnvLookup, name: &str) -> Option<OsString> {
+    env(name).filter(|value| !value.is_empty())
+}
+
+/// The user's home directory: `$HOME` on Unix, `%USERPROFILE%` on Windows. An empty value is
+/// no home, so nothing is ever resolved against the working folder.
 pub fn home_dir_in(os: Os, env: EnvLookup) -> Option<PathBuf> {
     let var = match os {
         Os::Unix => "HOME",
         Os::Windows => "USERPROFILE",
     };
-    env(var).map(PathBuf::from)
+    non_empty(env, var).map(PathBuf::from)
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -58,17 +64,29 @@ pub fn expand_home(path: &str) -> PathBuf {
     expand_home_in(CURRENT, path, home_dir().as_deref())
 }
 
-/// The current user's OpenSSH `known_hosts` file (`~/.ssh/known_hosts`).
-pub fn known_hosts_path() -> PathBuf {
-    home_dir().unwrap_or_default().join(".ssh").join("known_hosts")
+/// The user's OpenSSH `known_hosts` file (`~/.ssh/known_hosts`), or `None` without a home.
+pub fn known_hosts_path_in(os: Os, env: EnvLookup) -> Option<PathBuf> {
+    home_dir_in(os, env).map(|home| home.join(".ssh").join("known_hosts"))
 }
 
-/// The SSH agent to use: `SSH_AUTH_SOCK` when set; on Windows the OpenSSH agent pipe otherwise.
+/// The current user's OpenSSH `known_hosts` file (`~/.ssh/known_hosts`), or `None` without a
+/// home.
+pub fn known_hosts_path() -> Option<PathBuf> {
+    known_hosts_path_in(CURRENT, &env)
+}
+
+/// The SSH agent to use: `SSH_AUTH_SOCK` when set and not empty; on Windows the OpenSSH agent
+/// pipe otherwise.
 pub fn agent_endpoint_in(os: Os, env: EnvLookup) -> Option<PathBuf> {
-    env("SSH_AUTH_SOCK").map(PathBuf::from).or(match os {
+    non_empty(env, "SSH_AUTH_SOCK").map(PathBuf::from).or(match os {
         Os::Windows => Some(PathBuf::from(WINDOWS_AGENT_PIPE)),
         Os::Unix => None,
     })
+}
+
+/// The SSH agent to use: `explicit` when given, otherwise as [`agent_endpoint_in`].
+pub fn agent_endpoint(explicit: Option<&Path>, os: Os, env: EnvLookup) -> Option<PathBuf> {
+    explicit.map(Path::to_path_buf).or_else(|| agent_endpoint_in(os, env))
 }
 
 /// A connected SSH agent.
@@ -79,14 +97,12 @@ pub type Agent =
 /// machine's default.
 pub async fn connect_agent(endpoint: Option<&Path>) -> Result<Agent, russh::keys::Error> {
     use russh::keys::agent::client::AgentClient;
-    let endpoint = endpoint
-        .map(Path::to_path_buf)
-        .or_else(|| agent_endpoint_in(CURRENT, &env));
+    let endpoint = agent_endpoint(endpoint, CURRENT, &env);
     #[cfg(unix)]
     let agent = match endpoint {
         Some(socket) => AgentClient::connect_uds(socket).await?.dynamic(),
-        // Reports the same "SSH_AUTH_SOCK not set" error as OpenSSH-style clients.
-        None => AgentClient::connect_env().await?.dynamic(),
+        // The "SSH_AUTH_SOCK not set" error of OpenSSH-style clients.
+        None => return Err(russh::keys::Error::EnvVar("SSH_AUTH_SOCK")),
     };
     #[cfg(windows)]
     let agent = AgentClient::connect_named_pipe(endpoint.unwrap_or_else(|| WINDOWS_AGENT_PIPE.into()))
@@ -171,6 +187,59 @@ mod tests {
         let home = home_dir().expect("home directory");
         assert_eq!(expand_home("~/.ssh/id"), home.join(".ssh/id"));
         assert_eq!(expand_home("rel~/id"), PathBuf::from("rel~/id"));
+    }
+
+    #[test]
+    fn an_empty_home_is_no_home() {
+        assert_eq!(home_dir_in(Os::Unix, &vars(&[("HOME", "")])), None);
+        assert_eq!(home_dir_in(Os::Windows, &vars(&[("USERPROFILE", "")])), None);
+        // Without a home, `~/x` is left as typed instead of becoming the relative `x`.
+        let home = home_dir_in(Os::Unix, &vars(&[("HOME", "")]));
+        assert_eq!(expand_home_in(Os::Unix, "~/x", home.as_deref()), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn known_hosts_is_in_the_home_ssh_folder_and_unknown_without_a_home() {
+        assert_eq!(
+            known_hosts_path_in(Os::Unix, &vars(&[("HOME", "/home/me")])),
+            Some(PathBuf::from("/home/me/.ssh/known_hosts"))
+        );
+        assert_eq!(
+            known_hosts_path_in(Os::Windows, &vars(&[("USERPROFILE", r"C:\Users\me")])),
+            Some(Path::new(r"C:\Users\me").join(".ssh").join("known_hosts"))
+        );
+        // Never a path relative to the working folder.
+        assert_eq!(known_hosts_path_in(Os::Unix, &vars(&[])), None);
+        assert_eq!(known_hosts_path_in(Os::Unix, &vars(&[("HOME", "")])), None);
+        assert_eq!(known_hosts_path_in(Os::Windows, &vars(&[("USERPROFILE", "")])), None);
+    }
+
+    #[test]
+    fn an_empty_ssh_auth_sock_is_unset() {
+        let empty = vars(&[("SSH_AUTH_SOCK", "")]);
+        assert_eq!(agent_endpoint_in(Os::Unix, &empty), None);
+        assert_eq!(
+            agent_endpoint_in(Os::Windows, &empty),
+            Some(PathBuf::from(WINDOWS_AGENT_PIPE))
+        );
+    }
+
+    #[test]
+    fn an_explicit_agent_endpoint_overrides_the_environment() {
+        let sock = vars(&[("SSH_AUTH_SOCK", "/run/agent.sock")]);
+        let explicit = Path::new("/tmp/test-agent.sock");
+        for os in [Os::Unix, Os::Windows] {
+            assert_eq!(agent_endpoint(Some(explicit), os, &sock), Some(explicit.to_path_buf()));
+            assert_eq!(agent_endpoint(None, os, &sock), Some(PathBuf::from("/run/agent.sock")));
+        }
+        assert_eq!(agent_endpoint(None, Os::Unix, &vars(&[])), None);
+    }
+
+    #[tokio::test]
+    async fn connecting_to_a_missing_agent_socket_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-agent.sock");
+        assert!(connect_agent(Some(&missing)).await.is_err());
     }
 
     #[test]
