@@ -30,20 +30,36 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 /// How often the reaper looks for a foreground job still running (a scan of /proc).
 const JOB_POLL: Duration = Duration::from_millis(200);
 
-/// Environment variables for the child; `Debug` shows only their names, so values such as
-/// `MOSH_KEY` never reach logs or panic messages (TERM-1b).
+/// Environment variables for the child, and inherited ones it must not see; `Debug` shows only
+/// their names, so values such as `MOSH_KEY` never reach logs or panic messages (TERM-1b).
 #[derive(Clone, Default)]
-pub struct ChildEnv(Vec<(String, String)>);
+pub struct ChildEnv {
+    vars: Vec<(String, String)>,
+    removed: Vec<String>,
+}
 
 impl ChildEnv {
     pub fn new(vars: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self(vars.into_iter().collect())
+        Self {
+            vars: vars.into_iter().collect(),
+            removed: Vec::new(),
+        }
+    }
+
+    /// Also keeps the inherited variable `name` from the child.
+    #[must_use]
+    pub fn without(mut self, name: impl Into<String>) -> Self {
+        self.removed.push(name.into());
+        self
     }
 }
 
 impl std::fmt::Debug for ChildEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.iter().map(|(name, _)| name)).finish()
+        f.debug_struct("ChildEnv")
+            .field("vars", &self.vars.iter().map(|(name, _)| name).collect::<Vec<_>>())
+            .field("removed", &self.removed)
+            .finish()
     }
 }
 
@@ -214,9 +230,12 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
     if let Some(dir) = cwd_of(&spec) {
         cmd.cwd(dir);
     }
+    for name in &spec.env.removed {
+        cmd.env_remove(name);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    for (name, value) in &spec.env.0 {
+    for (name, value) in &spec.env.vars {
         cmd.env(name, value);
     }
 

@@ -114,6 +114,14 @@ fn extra_environment_reaches_the_process() {
 }
 
 #[test]
+fn removed_environment_never_reaches_the_process() {
+    let mut spec = sh("printf '<%s>' \"${HOME-unset}\"");
+    spec.env = ChildEnv::default().without("HOME");
+    let (_pty, _w, ring) = start(spec);
+    assert!(read_until(&ring, ">").contains("<unset>"));
+}
+
+#[test]
 fn extra_environment_is_never_shown_in_debug_output() {
     let env = ChildEnv::new([("MOSH_KEY".to_owned(), "do-not-log".to_owned())]);
     let shown = format!("{env:?}");
