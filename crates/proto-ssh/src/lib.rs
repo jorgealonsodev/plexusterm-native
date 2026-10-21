@@ -1208,7 +1208,8 @@ impl SshManager {
     /// new login) and returns its stdout. Output beyond [`MAX_EXEC_OUTPUT`] is dropped; a
     /// non-zero exit status, an exit signal or no answer within [`EXEC_TIMEOUT`] is an error. A
     /// command that does not answer in time has its channel closed, so it never keeps one of the
-    /// connection's limited sessions (OpenSSH `MaxSessions`, 10 by default).
+    /// connection's limited sessions (OpenSSH `MaxSessions`, 10 by default); sending that close
+    /// is itself bounded by [`EXEC_CLOSE_TIMEOUT`], so a stalled connection cannot hold `exec`.
     pub async fn exec(&self, id: u32, command: &str) -> Result<String, SshError> {
         let handle = self.entry(id, |entry| entry.handle.clone())?;
         let timeout = self.exec_timeout;
@@ -1223,7 +1224,9 @@ impl SshManager {
         match tokio::time::timeout_at(deadline, run_exec(&mut channel, command)).await {
             Ok(result) => result,
             Err(_) => {
-                let _ = channel.close().await;
+                // Sending the close waits for room in the connection's command queue, which a
+                // stalled connection never makes; dropping the channel then gives up on it.
+                let _ = tokio::time::timeout(EXEC_CLOSE_TIMEOUT, channel.close()).await;
                 Err(timed_out())
             }
         }
@@ -1268,6 +1271,8 @@ fn signal_name(signal: &russh::Sig) -> String {
 
 /// How long [`SshManager::exec`] waits for a command to finish.
 const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a timed-out [`SshManager::exec`] waits to send its channel close.
+const EXEC_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Bytes of stdout (and, separately, stderr) [`SshManager::exec`] keeps.
 const MAX_EXEC_OUTPUT: usize = 256 * 1024;
 

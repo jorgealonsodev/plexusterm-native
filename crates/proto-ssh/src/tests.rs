@@ -1215,6 +1215,68 @@ async fn exec_closes_its_channel_when_the_command_times_out() {
     );
 }
 
+/// After its deadline, `exec` must return even when the connection cannot take the channel
+/// close: here the session's own output ring is full, so russh's read loop is stuck delivering
+/// shell output and its 10-command queue is filled by other requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exec_timeout_returns_even_when_the_close_cannot_be_sent() {
+    let server = test_server::start(1, None).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = trusting(&dir, server.addr.port(), &server.host_key).with_exec_timeout(Duration::from_millis(1500));
+    // Nobody drains this ring: once it is full the shell reader stops taking messages.
+    let out = ByteRing::new(64);
+    let id = mgr
+        .connect(request(server.addr.port(), password(PASSWORD)), out.clone())
+        .await
+        .unwrap()
+        .id;
+    let mgr = Arc::new(mgr);
+    let handle = mgr.entry(id, |entry| entry.handle.clone()).unwrap();
+
+    let exec = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move { mgr.exec(id, "sleep-forever").await })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while server.open_exec_channels() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the exec channel never opened");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Echoed input fills the ring, then the shell channel's queue, which stops the read loop.
+    let writer = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            for _ in 0..1000 {
+                if mgr.write(id, b"x").await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Requests that never get through fill the connection's command queue.
+    let mut stuck = Vec::new();
+    for _ in 0..50 {
+        let handle = handle.clone();
+        stuck.push(tokio::spawn(async move {
+            let _ = handle.channel_open_session().await;
+        }));
+    }
+
+    let result = tokio::time::timeout(Duration::from_secs(8), exec).await;
+    // Unblock the stuck reader (it waits on the blocking pool) so the runtime can shut down.
+    out.close();
+    writer.abort();
+    for task in stuck {
+        task.abort();
+    }
+    let err = result
+        .expect("exec did not return after its deadline")
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("did not finish"), "{err}");
+}
+
 #[tokio::test]
 async fn exec_reports_a_command_killed_by_a_signal_as_an_error() {
     let server = test_server::start(1, None).await;
