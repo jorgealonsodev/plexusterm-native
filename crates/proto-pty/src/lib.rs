@@ -9,7 +9,8 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,7 +20,8 @@ use term_engine::ByteRing;
 
 /// Bytes read from the PTY per call.
 const READ_CHUNK: usize = 64 * 1024;
-/// After the process exits, how long the reader may keep draining output still in the PTY.
+/// After the process exits, how long the reader may wait for more output while idle in a read
+/// (a background job holding the terminal). A reader pushing into a full ring is never cut off.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 /// How long a hung-up program has before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(2);
@@ -163,10 +165,14 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
     });
 
     let (drained_tx, drained) = mpsc::channel::<()>();
+    let progress = Arc::new(ReaderProgress {
+        pushing: AtomicBool::new(false),
+        last_read: Mutex::new(Instant::now()),
+    });
     let reader_thread = {
-        let (output, terminator) = (output.clone(), terminator.clone());
+        let (output, terminator, progress) = (output.clone(), terminator.clone(), progress.clone());
         move || {
-            read_into(reader, &output, &terminator);
+            read_into(reader, &output, &terminator, &progress);
             let _ = drained_tx.send(());
         }
     };
@@ -176,9 +182,15 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
         move || {
             let code = child.wait().ok().map(|status| status.exit_code());
             *terminator.exit.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
-            // Let the reader take what the program printed last; a background job that keeps the
-            // terminal open must not keep the session alive after its shell ended.
-            let _ = drained.recv_timeout(DRAIN_AFTER_EXIT);
+            // Let the reader take everything the program printed; only a reader idle in a read
+            // (a background job keeping the terminal open) stops the session from ending.
+            loop {
+                match drained.recv_timeout(Duration::from_millis(50)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) if progress.idle_for(DRAIN_AFTER_EXIT) => break,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
             output.close();
         }
     };
@@ -202,14 +214,38 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
     Ok((pty, writer))
 }
 
-fn read_into(mut reader: Box<dyn Read + Send>, output: &ByteRing, terminator: &Arc<Terminator>) {
+/// What the reader is doing, so the waiter can tell backpressure from a terminal held open.
+struct ReaderProgress {
+    pushing: AtomicBool,
+    last_read: Mutex<Instant>,
+}
+
+impl ReaderProgress {
+    fn idle_for(&self, quiet: Duration) -> bool {
+        !self.pushing.load(Ordering::Acquire)
+            && self.last_read.lock().unwrap_or_else(PoisonError::into_inner).elapsed() >= quiet
+    }
+}
+
+fn read_into(
+    mut reader: Box<dyn Read + Send>,
+    output: &ByteRing,
+    terminator: &Arc<Terminator>,
+    progress: &ReaderProgress,
+) {
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        match reader.read(&mut buf) {
+        let read = reader.read(&mut buf);
+        *progress.last_read.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        match read {
             Ok(0) => return,
             Ok(n) => {
                 let Some(bytes) = buf.get(..n) else { return };
-                if output.push(bytes).is_err() {
+                progress.pushing.store(true, Ordering::Release);
+                let pushed = output.push(bytes);
+                *progress.last_read.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+                progress.pushing.store(false, Ordering::Release);
+                if pushed.is_err() {
                     // Nobody reads this terminal any more: end its program.
                     terminator.terminate();
                     return;

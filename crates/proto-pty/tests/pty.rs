@@ -309,3 +309,20 @@ fn dropping_the_terminal_ends_its_stream_even_when_nobody_reads() {
     drop(pty);
     assert!(ring_closed(&ring));
 }
+
+#[test]
+fn output_printed_before_the_exit_survives_a_slow_reader() {
+    let ring = ByteRing::new(1024);
+    let (pty, _w) = spawn(
+        sh("i=0; while [ $i -lt 600 ]; do printf 'row %05d\\n' $i; i=$((i+1)); done; printf TAIL"),
+        ring.clone(),
+    )
+    .unwrap();
+    // Read nothing until well after the program exited with its output stuck behind the full ring.
+    std::thread::sleep(Duration::from_millis(800));
+    let out = read_until(&ring, "TAIL");
+    let rows = out.lines().filter(|l| l.starts_with("row ")).count();
+    assert_eq!(rows, 600, "no row lost");
+    assert!(out.contains("TAIL"));
+    assert!(pty.exit_code().is_some());
+}
