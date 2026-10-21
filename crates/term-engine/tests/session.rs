@@ -363,3 +363,28 @@ fn many_keys_typed_during_a_long_paste_are_all_accepted_in_order() {
     }
     assert!(*sink.0.lock().unwrap() == expected);
 }
+
+/// A source that never consumes input, so pastes stay queued.
+struct StuckSink;
+impl Write for StuckSink {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        thread::sleep(Duration::from_secs(3600));
+        Ok(0)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn pastes_beyond_the_byte_budget_are_refused_and_the_budget_is_refunded() {
+    let session = Session::start(config(), ByteRing::new(1024), Box::new(StuckSink), quiet_hooks());
+    session.paste(vec![b'a'; 40 * 1024 * 1024]).unwrap();
+    assert_eq!(
+        session.paste(vec![b'b'; 30 * 1024 * 1024]),
+        Err(WriteError::Full),
+        "70 MiB queued is over the 64 MiB budget"
+    );
+    session.paste(vec![b'c'; 20 * 1024 * 1024]).unwrap();
+    assert_eq!(session.paste(vec![b'd'; 8 * 1024 * 1024]), Err(WriteError::Full));
+}

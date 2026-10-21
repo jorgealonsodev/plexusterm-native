@@ -179,3 +179,59 @@ fn the_session_parser_never_sees_an_oversized_string() {
         .count();
     assert_eq!(titles, 0, "a cancelled title never reaches the owner");
 }
+
+#[test]
+fn can_and_sub_end_a_string_and_are_forwarded_with_it() {
+    for end in [0x18u8, 0x1a] {
+        let input = [b"\x1b]2;short".as_slice(), &[end], b"next"].concat();
+        assert_eq!(filtered(&mut SequenceGuard::default(), &[&input]), input);
+    }
+    let mut long = b"\x1b]2;".to_vec();
+    long.extend(std::iter::repeat_n(b'x', 70 * 1024));
+    long.extend_from_slice(b"\x18next");
+    assert_eq!(
+        filtered(&mut SequenceGuard::default(), &[&long]),
+        b"next",
+        "an oversized string ended by CAN is dropped with it"
+    );
+}
+
+#[test]
+fn sos_pm_and_apc_strings_are_bounded_too() {
+    for introducer in *b"X^_" {
+        let short = [b"\x1b".as_slice(), &[introducer], b"data\x1b\\"].concat();
+        assert_eq!(filtered(&mut SequenceGuard::default(), &[&short]), short);
+        let mut long = vec![0x1b, introducer];
+        long.extend(std::iter::repeat_n(b'y', 70 * 1024));
+        long.extend_from_slice(b"\x1b\\after");
+        assert_eq!(filtered(&mut SequenceGuard::default(), &[&long]), b"after");
+    }
+}
+
+#[test]
+fn esc_esc_inside_a_string_ends_it_and_keeps_the_second_escape() {
+    let input = b"\x1b]2;t\x1b\x1b[1mX";
+    assert_eq!(filtered(&mut SequenceGuard::default(), &[input]), input.to_vec());
+}
+
+#[test]
+fn only_the_latest_title_of_a_batch_is_reported() {
+    let (session, ring, events) = session_with_events();
+    ring.push(b"\x1b]2;first\x07\x1b]2;second\x07\x1b]2;third\x07done")
+        .unwrap();
+    wait_for("the text", || session.full_frame().text_of_row(0).starts_with("done"));
+    let titles: Vec<String> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| {
+            if let SessionEvent::Title(t) = e {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // The three titles arrive in one push, so the parser handles them in one batch.
+    assert_eq!(titles, vec!["third".to_owned()]);
+}
