@@ -12,7 +12,11 @@
 //! that is no longer saved as it was ends as if the key had been refused. The app calls
 //! [`TunnelManager::stop_all`] on exit.
 
+#[cfg(test)]
+mod interop_tests;
 pub mod socks;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -244,8 +248,24 @@ impl TunnelManager {
         self
     }
 
+    #[cfg(test)]
+    fn with_storage_timeout(mut self, timeout: Duration) -> Self {
+        self.storage_timeout = Some(timeout);
+        self
+    }
+
     /// Opens the tunnel's SSH connection and starts forwarding, without
     /// touching saved passwords (tests; the app uses `start_with`).
+    #[cfg(test)]
+    pub async fn start(
+        &self,
+        tunnel: TunnelDefinition,
+        target: SshTarget,
+        trusted_fingerprint: Option<String>,
+    ) -> Result<(), TunnelError> {
+        self.start_with(tunnel, target, trusted_fingerprint, None).await
+    }
+
     /// Opens the tunnel's SSH connection and starts forwarding, then saves or forgets the session's
     /// password as `storage` asks once the login succeeded.
     ///
@@ -449,6 +469,13 @@ impl TunnelManager {
             shutdowns.spawn(running.shutdown());
         }
         while shutdowns.join_next().await.is_some() {}
+    }
+
+    #[cfg(test)]
+    fn status(&self, id: &str) -> TunnelStatus {
+        lock(&self.shared.entries)
+            .get(id)
+            .map_or(TunnelStatus::Stopped, |entry| entry.status.clone())
     }
 
     /// Status of every tunnel started since launch.
