@@ -8,9 +8,13 @@
 
 pub mod layout;
 pub mod multi_exec;
+pub mod tab_drag;
+pub mod tabs;
 
 pub use layout::{
     FocusDirection, MAX_PANES, MAX_RATIO, MIN_RATIO, PaneId, PaneLayout, Rect, Side, Split, SplitBox, SplitDirection,
     SplitId, clamp_ratio,
 };
 pub use multi_exec::{MultiExec, PaneInfo, Registration, WriterRegistry, broadcast_targets, multi_exec_group};
+pub use tab_drag::{DRAG_THRESHOLD, DropMarker, TabDrag, landing_index};
+pub use tabs::{ChatAction, ChatLink, PathOrigin, Tab, TabId, Tabs, ViewerLink, ViewerPosition};
