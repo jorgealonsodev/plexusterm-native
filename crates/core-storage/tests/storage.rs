@@ -214,3 +214,23 @@ fn write_text_writes_in_place_keeping_the_files_identity_mode_and_links() {
     assert_eq!(after.permissions().mode() & 0o777, 0o640);
     assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn write_text_to_a_fifo_succeeds_although_it_cannot_be_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("pipe");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let reader = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || std::fs::read_to_string(fifo).unwrap())
+    };
+    write_text(&fifo, "through the pipe\n", 1024).unwrap();
+    assert_eq!(reader.join().unwrap(), "through the pipe\n");
+}

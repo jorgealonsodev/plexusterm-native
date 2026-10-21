@@ -130,10 +130,21 @@ pub fn write_text(path: &Path, contents: &str, max_bytes: u64) -> Result<(), Sto
         .truncate(true)
         .open(path)
         .map_err(|err| io(path, err))?;
-    // Durable once reported: the bytes are on disk before success is returned.
-    file.write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|err| io(path, err))
+    file.write_all(contents.as_bytes()).map_err(|err| io(path, err))?;
+    // Durable once reported. Pipes, devices and some network or FUSE file systems cannot be
+    // synced (EINVAL / ENOTSUP); the bytes were written, so that is not a failure.
+    match file.sync_all() {
+        Err(err) if !syncable(&err) => Ok(()),
+        result => result.map_err(|err| io(path, err)),
+    }
+}
+
+/// Whether a failed fsync is a real error rather than a target that cannot be synced.
+fn syncable(err: &std::io::Error) -> bool {
+    !matches!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    )
 }
 
 /// Appends to a text file the user chose (e.g. a session log), creating it when missing.
