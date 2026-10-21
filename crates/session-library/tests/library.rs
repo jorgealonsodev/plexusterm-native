@@ -785,6 +785,19 @@ fn finds_local_sessions_by_name_or_program_and_opens_them_as_local_targets() {
 
 // SES-1c: Copy SSH command (library.ts `sshCommandOf`; the v0.2.15 test lives in SessionsPanel.test.tsx).
 
+/// A user name starting with `-` would be read by ssh as an option (`-oProxyCommand=...`).
+#[test]
+fn a_copied_ssh_command_never_lets_the_destination_read_as_an_option() {
+    let hostile = SshSession {
+        username: "-oProxyCommand=touch /tmp/x".into(),
+        ..session()
+    };
+    assert_eq!(
+        ssh_command_of(&hostile),
+        "ssh -p 22 -- '-oProxyCommand=touch /tmp/x@web.example.com'"
+    );
+}
+
 #[test]
 fn copies_an_ssh_session_as_an_ssh_command_shell_quoted_without_jump_hosts() {
     assert_eq!(ssh_command_of(&session()), "ssh -p 22 deploy@web.example.com");
