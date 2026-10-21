@@ -27,6 +27,8 @@ const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
 const HANGUP_GRACE: Duration = Duration::from_secs(2);
 /// How often the waiter checks whether the process ended (reaping happens only under a lock).
 const EXIT_POLL: Duration = Duration::from_millis(20);
+/// How often the reaper looks for a foreground job still running (a scan of /proc).
+const JOB_POLL: Duration = Duration::from_millis(200);
 
 /// Environment variables for the child; `Debug` shows only their names, so values such as
 /// `MOSH_KEY` never reach logs or panic messages (TERM-1b).
@@ -133,7 +135,16 @@ impl Terminator {
             // The grace period covers the foreground job too: a shell passes the hang-up on and
             // exits at once, while its job may still be saving.
             let deadline = Instant::now() + HANGUP_GRACE;
-            while Instant::now() < deadline && !(this.exited() && !this.job_running(foreground)) {
+            let mut next_job_check = Instant::now();
+            while Instant::now() < deadline {
+                // The shell is checked often; the job (a scan of /proc) only once the shell ended
+                // and only every JOB_POLL.
+                if this.exited() && Instant::now() >= next_job_check {
+                    if !this.job_running(foreground) {
+                        break;
+                    }
+                    next_job_check = Instant::now() + JOB_POLL;
+                }
                 thread::sleep(Duration::from_millis(20));
             }
             this.force_kill(foreground);
