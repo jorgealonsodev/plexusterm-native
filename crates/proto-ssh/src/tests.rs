@@ -1732,3 +1732,18 @@ async fn closing_the_output_ring_ends_the_connection() {
     assert!(wait_exit(shell.exit).await.is_some(), "the session did not end");
     assert_eq!(wait_connections(&server, 0).await, 0, "the connection is still open");
 }
+
+#[test]
+fn the_exec_timeout_message_keeps_the_v0215_text() {
+    assert_eq!(
+        crate::exec_timeout_message(crate::EXEC_TIMEOUT),
+        format!(
+            "remote command did not finish within {} s",
+            crate::EXEC_TIMEOUT.as_secs()
+        )
+    );
+    assert_eq!(
+        crate::exec_timeout_message(Duration::from_secs(10)),
+        "remote command did not finish within 10 s"
+    );
+}

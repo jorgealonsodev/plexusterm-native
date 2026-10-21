@@ -1213,7 +1213,7 @@ impl SshManager {
         let handle = self.entry(id, |entry| entry.handle.clone())?;
         let timeout = self.exec_timeout;
         let timed_out = || SshError::Connection {
-            message: format!("remote command did not finish within {timeout:?}"),
+            message: exec_timeout_message(timeout),
         };
         let deadline = tokio::time::Instant::now() + timeout;
         let mut channel = tokio::time::timeout_at(deadline, handle.channel_open_session())
@@ -1274,4 +1274,9 @@ const MAX_EXEC_OUTPUT: usize = 256 * 1024;
 fn append_capped(buffer: &mut Vec<u8>, data: &[u8]) {
     let room = MAX_EXEC_OUTPUT.saturating_sub(buffer.len());
     buffer.extend(data.iter().take(room));
+}
+
+/// The error text of an exec that did not answer in time, unchanged from v0.2.15.
+fn exec_timeout_message(timeout: Duration) -> String {
+    format!("remote command did not finish within {} s", timeout.as_secs())
 }
