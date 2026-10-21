@@ -1,0 +1,28 @@
+[package]
+name = "plexusterm"
+description = "PlexusTerm Native: windows, panes, features wiring and runtime bridge (PRD §6.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "plexusterm"
+path = "src/main.rs"
+
+[dependencies]
+# GPUI from the Zed monorepo at an exact rev (PRD §6.2, ST-13); crates.io `gpui` 0.2.2 is obsolete.
+# Only Apache-2.0 crates of that repo are used (D5).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "a484d108da9164cd6a705e7422a0ddd33499fb50" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "a484d108da9164cd6a705e7422a0ddd33499fb50", features = ["x11", "wayland"] }
+futures = "0.3"
+proto-pty = { path = "../proto-pty" }
+term-engine = { path = "../term-engine" }
+ui-theme = { path = "../ui-theme" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Only to build truecolor cells in tests; the same exact version term-engine wraps.
+alacritty_terminal = "=0.26.0"

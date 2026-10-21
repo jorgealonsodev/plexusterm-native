@@ -1,0 +1,348 @@
+//! One terminal pane on a local PTY (PRD §6.1 terminal widget, §6.3, TERM-1, TERM-2).
+//!
+//! The PTY reader and the parser run on their own threads (proto-pty, term-engine); this view
+//! only copies damage frames into its row cache, shapes the rows that changed and paints.
+
+use std::cell::{Cell as StdCell, RefCell};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures::StreamExt;
+use futures::channel::mpsc;
+use gpui::{
+    App, Bounds, Context, FocusHandle, Font, FontStyle, FontWeight, Hsla, KeyDownEvent, Pixels, Rgba, ShapedLine,
+    StrikethroughStyle, Task, TextAlign, TextRun, UnderlineStyle, Window, canvas, div, fill, font, point, prelude::*,
+    px, size,
+};
+use proto_pty::{LocalPty, SpawnSpec};
+use term_engine::{ByteRing, Session, SessionConfig, SessionHooks, SessionState};
+use ui_theme::{Palette, Rgb};
+
+use crate::grid::{Grid, Row};
+use crate::keys::{KeyAction, Mods, encode};
+
+/// TERM-18 default family, then the M0 fallback (JetBrains Mono is not bundled yet).
+const FONT_FAMILIES: [&str; 2] = ["JetBrains Mono", "DejaVu Sans Mono"];
+const FONT_SIZE: f32 = 14.0;
+/// TERM-2: host padding on `bg`.
+pub const PADDING: f32 = 6.0;
+/// TERM-2: bar cursor width.
+const CURSOR_WIDTH: f32 = 2.0;
+/// TERM-2: scrollback lines.
+const SCROLLBACK: usize = 10_000;
+
+/// Size of one cell in the chosen font.
+#[derive(Clone, Copy, Debug)]
+struct CellSize {
+    width: Pixels,
+    height: Pixels,
+}
+
+/// The rows as shaped for painting, each tagged with the row version it was shaped from.
+type Shaped = Vec<Option<(u64, ShapedLine)>>;
+
+pub struct TerminalView {
+    session: Arc<Session>,
+    /// Kept alive for the pane's life: dropping it ends the shell.
+    _pty: Arc<LocalPty>,
+    palette: Palette,
+    font: Font,
+    cell: CellSize,
+    grid: Rc<RefCell<Grid>>,
+    shaped: Rc<RefCell<Shaped>>,
+    /// Last size asked of the session, so a pane resize is requested once.
+    requested: Rc<StdCell<(u16, u16)>>,
+    focus: FocusHandle,
+    _pump: Task<()>,
+}
+
+/// Why a terminal pane could not start.
+#[derive(Debug)]
+pub struct StartError(pub String);
+
+/// A started local session, before it has a view.
+pub struct LocalSession {
+    session: Arc<Session>,
+    pty: Arc<LocalPty>,
+    wakes: mpsc::UnboundedReceiver<()>,
+    pending: Arc<AtomicBool>,
+    size: (u16, u16),
+}
+
+impl LocalSession {
+    /// Spawns the user's shell on a PTY and starts its session (ST-7: before the window exists).
+    pub fn start() -> Result<Self, StartError> {
+        let (columns, rows) = (80, 24);
+        let ring = ByteRing::new(ByteRing::SESSION_CAPACITY);
+        let spec = SpawnSpec {
+            columns,
+            rows,
+            ..SpawnSpec::default()
+        };
+        let (pty, writer) = proto_pty::spawn(spec, ring.clone()).map_err(|e| StartError(e.to_string()))?;
+        let pty = Arc::new(pty);
+
+        // The parser thread only flags that something happened; the view's foreground pump does
+        // the UI work. At most one wake-up is ever queued, so the channel stays bounded.
+        let (wake_tx, wakes) = mpsc::unbounded::<()>();
+        let pending = Arc::new(AtomicBool::new(false));
+        let hooks = SessionHooks {
+            on_event: {
+                let pending = pending.clone();
+                Arc::new(move |_event| {
+                    if !pending.swap(true, Ordering::AcqRel) {
+                        let _ = wake_tx.unbounded_send(());
+                    }
+                })
+            },
+            on_resize: {
+                let pty = pty.clone();
+                Arc::new(move |columns, rows| {
+                    let _ = pty.resize(columns, rows);
+                })
+            },
+        };
+        let config = SessionConfig {
+            columns,
+            rows,
+            scrollback: SCROLLBACK,
+        };
+        let session = Arc::new(Session::start(config, ring, writer, hooks));
+        Ok(Self {
+            session,
+            pty,
+            wakes,
+            pending,
+            size: (columns, rows),
+        })
+    }
+}
+
+impl TerminalView {
+    pub fn new(local: LocalSession, palette: Palette, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let LocalSession {
+            session,
+            pty,
+            mut wakes,
+            pending,
+            size: (columns, rows),
+        } = local;
+        let pump = cx.spawn(async move |this, cx| {
+            while wakes.next().await.is_some() {
+                pending.store(false, Ordering::Release);
+                let running = this.update(cx, |view, cx| {
+                    if view.session.state() == SessionState::Running {
+                        cx.notify();
+                        true
+                    } else {
+                        // v0.2.15 closes a local pane when its shell ends; this is the only pane.
+                        cx.quit();
+                        false
+                    }
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        });
+
+        let font = pick_font(window);
+        let cell = measure(&font, window);
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        Self {
+            session,
+            _pty: pty,
+            palette,
+            font,
+            cell,
+            grid: Rc::default(),
+            shaped: Rc::default(),
+            requested: Rc::new(StdCell::new((columns, rows))),
+            focus,
+            _pump: pump,
+        }
+    }
+
+    /// Copies what changed since the last frame into the row cache (the only lock the UI takes).
+    fn sync(&mut self) {
+        if let Some(frame) = self.session.snapshot() {
+            self.grid.borrow_mut().apply(&frame, &self.palette);
+        }
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let m = keystroke.modifiers;
+        let mods = Mods {
+            ctrl: m.control,
+            alt: m.alt,
+            shift: m.shift,
+            platform: m.platform,
+        };
+        match encode(&keystroke.key, keystroke.key_char.as_deref(), mods) {
+            KeyAction::Send(bytes) => {
+                // A full queue means the program is not reading; the key is dropped, never waited on.
+                let _ = self.session.write(&bytes);
+            }
+            KeyAction::Paste => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let _ = self.session.paste(text.into_bytes());
+                }
+            }
+            // M0 has no selection, so there is nothing to copy.
+            KeyAction::Copy => {}
+            KeyAction::Ignore => return,
+        }
+        cx.stop_propagation();
+    }
+}
+
+fn pick_font(window: &Window) -> Font {
+    let installed = window.text_system().all_font_names();
+    FONT_FAMILIES
+        .iter()
+        .find(|family| installed.iter().any(|name| name == *family))
+        .map_or_else(|| font("monospace"), |family| font(*family))
+}
+
+fn measure(font: &Font, window: &Window) -> CellSize {
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(font);
+    let font_size = px(FONT_SIZE);
+    let width = text_system
+        .advance(font_id, font_size, 'm')
+        .map(|advance| advance.width)
+        .unwrap_or(px(FONT_SIZE * 0.6));
+    // TERM-18 line height 1.0: the font's own cell height.
+    let height = text_system.ascent(font_id, font_size) + text_system.descent(font_id, font_size).abs();
+    CellSize {
+        width,
+        height: height.ceil(),
+    }
+}
+
+pub fn hsla(c: Rgb) -> Hsla {
+    Rgba {
+        r: f32::from(c.r) / 255.0,
+        g: f32::from(c.g) / 255.0,
+        b: f32::from(c.b) / 255.0,
+        a: 1.0,
+    }
+    .into()
+}
+
+fn text_runs(row: &Row, base: &Font) -> Vec<TextRun> {
+    row.spans
+        .iter()
+        .map(|span| {
+            let style = span.style;
+            let color = hsla(style.fg);
+            let mut font = base.clone();
+            if style.bold {
+                font.weight = FontWeight::BOLD;
+            }
+            if style.italic {
+                font.style = FontStyle::Italic;
+            }
+            TextRun {
+                len: span.len,
+                font,
+                color,
+                background_color: style.bg.map(hsla),
+                underline: style.underline.then_some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(color),
+                    wavy: false,
+                }),
+                strikethrough: style.strikeout.then_some(StrikethroughStyle {
+                    thickness: px(1.0),
+                    color: Some(color),
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Rows and columns that fit in `bounds` (at least one of each).
+fn fit(bounds: Bounds<Pixels>, cell: CellSize) -> (u16, u16) {
+    let count = |space: Pixels, step: Pixels| {
+        let n = (f32::from(space) / f32::from(step)).floor();
+        // Clamped to 1..=u16::MAX first, so the cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n = n.clamp(1.0, f32::from(u16::MAX)) as u16;
+        n
+    };
+    (
+        count(bounds.size.width, cell.width),
+        count(bounds.size.height, cell.height),
+    )
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync();
+        let bg = hsla(self.palette.background);
+        let cursor_color = hsla(self.palette.cursor);
+        let (grid, shaped, requested) = (self.grid.clone(), self.shaped.clone(), self.requested.clone());
+        let (session, font, cell) = (self.session.clone(), self.font.clone(), self.cell);
+
+        let prepaint = {
+            let grid = grid.clone();
+            let shaped = shaped.clone();
+            move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
+                // ST-6: ask for the new size; the session applies it on the next snapshot.
+                let fits = fit(bounds, cell);
+                if fits != requested.get() {
+                    requested.set(fits);
+                    session.request_resize(fits.0, fits.1);
+                    window.refresh();
+                }
+                // ST-4: shape only rows whose version changed since they were last shaped.
+                let grid = grid.borrow();
+                let mut shaped = shaped.borrow_mut();
+                shaped.resize_with(grid.rows.len(), || None);
+                shaped.truncate(grid.rows.len());
+                for (row, slot) in grid.rows.iter().zip(shaped.iter_mut()) {
+                    if slot.as_ref().is_some_and(|(version, _)| *version == row.version) {
+                        continue;
+                    }
+                    let line = window.text_system().shape_line(
+                        row.text.clone().into(),
+                        px(FONT_SIZE),
+                        &text_runs(row, &font),
+                        Some(cell.width),
+                    );
+                    *slot = Some((row.version, line));
+                }
+            }
+        };
+        let paint = move |bounds: Bounds<Pixels>, (): (), window: &mut Window, cx: &mut App| {
+            let shaped = shaped.borrow();
+            for (index, slot) in shaped.iter().enumerate() {
+                let Some((_, line)) = slot else { continue };
+                #[allow(clippy::cast_precision_loss, reason = "row indexes are far below 2^24")]
+                let origin = bounds.origin + point(px(0.0), cell.height * index as f32);
+                let _ = line.paint_background(origin, cell.height, TextAlign::Left, None, window, cx);
+                let _ = line.paint(origin, cell.height, TextAlign::Left, None, window, cx);
+            }
+            if let Some((row, column)) = grid.borrow().cursor {
+                #[allow(clippy::cast_precision_loss, reason = "screen positions are far below 2^24")]
+                let origin = bounds.origin + point(cell.width * column as f32, cell.height * row as f32);
+                window.paint_quad(fill(
+                    Bounds::new(origin, size(px(CURSOR_WIDTH), cell.height)),
+                    cursor_color,
+                ));
+            }
+        };
+
+        div()
+            .size_full()
+            .bg(bg)
+            .p(px(PADDING))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::key_down))
+            .child(canvas(prepaint, paint).size_full())
+    }
+}
