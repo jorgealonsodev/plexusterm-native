@@ -311,6 +311,7 @@ name = "proto-pty"
 version = "0.1.0"
 dependencies = [
  "portable-pty",
+ "rustix",
  "term-engine",
 ]
 

@@ -136,14 +136,19 @@ fn a_starting_directory_with_a_tilde_starts_in_the_home_directory() {
 fn a_blank_program_or_directory_keeps_the_defaults() {
     let spec = SpawnSpec {
         program: Some("   ".into()),
-        args: vec!["-c".into(), "printf default-shell-ok".into()],
+        args: vec!["-c".into(), "printf 'dir:%s:default-shell-ok' \"$(pwd -P)\"".into()],
         cwd: Some(" ".into()),
         columns: 80,
         rows: 24,
         ..SpawnSpec::default()
     };
     let (_pty, _w, ring) = start(spec);
-    assert!(read_until(&ring, "default-shell-ok").contains("default-shell-ok"));
+    let out = read_until(&ring, "default-shell-ok");
+    let home = std::fs::canonicalize(std::env::var("HOME").unwrap()).unwrap();
+    assert!(
+        out.contains(&format!("dir:{}:default-shell-ok", home.display())),
+        "{out}"
+    );
 }
 
 #[test]
@@ -166,8 +171,22 @@ fn cwd_follows_the_shell_folder() {
 #[cfg(target_os = "linux")]
 #[test]
 fn program_cwd_follows_the_program_in_the_foreground() {
-    let (pty, _w, ring) = start(sh("cd /usr/bin && printf READY && sleep 5"));
+    // An interactive bash runs the inner program as its own foreground process group.
+    let spec = SpawnSpec {
+        program: Some("/bin/bash".into()),
+        args: vec![
+            "--norc".into(),
+            "-i".into(),
+            "-c".into(),
+            "cd /usr && sh -c 'cd /usr/bin && printf READY && sleep 5'; true".into(),
+        ],
+        columns: 80,
+        rows: 24,
+        ..SpawnSpec::default()
+    };
+    let (pty, _w, ring) = start(spec);
     read_until(&ring, "READY");
+    assert_eq!(pty.cwd().as_deref(), Some("/usr"), "the shell stays in its own folder");
     assert_eq!(pty.program_cwd().as_deref(), Some("/usr/bin"));
 }
 
@@ -194,17 +213,27 @@ fn output_waits_for_the_reader_instead_of_being_dropped() {
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    assert!(ring.len() <= 1024, "the reader blocks on the full ring");
     let out = read_until(&ring, "DONE");
-    for i in [0, 999, 1999] {
-        assert!(out.contains(&format!("line {i:05}")), "line {i} missing");
-    }
+    let lines: Vec<_> = out
+        .lines()
+        .filter(|l| l.starts_with("line "))
+        .map(|l| l.trim_end().to_owned())
+        .collect();
+    let expected: Vec<_> = (0..2000).map(|i| format!("line {i:05}")).collect();
+    assert_eq!(
+        lines, expected,
+        "every line arrives once, in order, although the ring was full"
+    );
 }
 
 #[test]
 fn a_session_that_stops_reading_ends_its_program() {
     let ring = ByteRing::new(1024);
-    let (pty, _w) = spawn(sh("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx\\n'; done"), ring.clone()).unwrap();
+    let (pty, _w) = spawn(
+        sh("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx\\n'; done"),
+        ring.clone(),
+    )
+    .unwrap();
     read_until(&ring, "xxxx");
     ring.close();
     wait_for_exit(&pty);
@@ -227,7 +256,16 @@ fn a_shell_runs_end_to_end_into_a_session_frame() {
             }
         }),
     };
-    let session = Session::start(SessionConfig { columns: 80, rows: 24, scrollback: 10_000 }, ring, writer, hooks);
+    let session = Session::start(
+        SessionConfig {
+            columns: 80,
+            rows: 24,
+            scrollback: 10_000,
+        },
+        ring,
+        writer,
+        hooks,
+    );
     session.write(b"hi\r").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -238,4 +276,36 @@ fn a_shell_runs_end_to_end_into_a_session_frame() {
         assert!(Instant::now() < deadline, "the shell's answer never reached the screen");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn the_exit_is_seen_while_a_background_job_keeps_the_terminal_open() {
+    let (pty, _w, ring) = start(sh("(trap '' HUP; sleep 30) & printf READY; exit 4"));
+    read_until(&ring, "READY");
+    assert_eq!(wait_for_exit(&pty), Some(4));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ring_closed(&ring) {
+        assert!(
+            Instant::now() < deadline,
+            "the stream stayed open after the shell exited"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_program_that_ignores_the_hang_up_is_killed() {
+    let (pty, _w, ring) = start(sh("trap '' HUP; printf READY; while :; do sleep 1; done"));
+    read_until(&ring, "READY");
+    pty.kill();
+    wait_for_exit(&pty);
+}
+
+#[test]
+fn dropping_the_terminal_ends_its_stream_even_when_nobody_reads() {
+    let ring = ByteRing::new(64);
+    let (pty, _w) = spawn(sh("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx'; done"), ring.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    drop(pty);
+    assert!(ring_closed(&ring));
 }

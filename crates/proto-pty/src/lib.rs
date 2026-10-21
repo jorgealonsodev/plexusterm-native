@@ -2,18 +2,27 @@
 //! `src-tauri/src/pty/mod.rs` (PRD TERM-1, TERM-15, TERM-16).
 //!
 //! The PTY output is pushed into a [`ByteRing`]: a full ring blocks the reader thread, so a
-//! busy parser holds back the program instead of output being dropped (PRD §6.3 ST-3).
+//! busy parser holds back the program instead of output being dropped (PRD §6.3 ST-3). The
+//! process is waited for on its own thread, so its exit is seen even while a background job
+//! keeps the terminal open, and ending a terminal escalates to `SIGKILL` for programs that
+//! ignore the hang-up (ST-8, ST-16).
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use term_engine::ByteRing;
 
 /// Bytes read from the PTY per call.
 const READ_CHUNK: usize = 64 * 1024;
+/// After the process exits, how long the reader may keep draining output still in the PTY.
+const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(250);
+/// How long a hung-up program has before it is killed.
+const HANGUP_GRACE: Duration = Duration::from_secs(2);
 
 /// Environment variables for the child; `Debug` shows only their names, so values such as
 /// `MOSH_KEY` never reach logs or panic messages (TERM-1b).
@@ -61,18 +70,63 @@ fn error(e: impl std::fmt::Display) -> PtyError {
     PtyError(e.to_string())
 }
 
-/// A running local terminal. Dropping it kills the process.
-pub struct LocalPty {
-    master: Mutex<Box<dyn MasterPty + Send>>,
+/// Ends the process: a hang-up first, then `SIGKILL` to its process group if it is still running.
+struct Terminator {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
-    /// `None` while running; `Some(code)` once the process ended (`code` is `None` when the
-    /// system did not report one).
-    exit: Arc<Mutex<Option<Option<u32>>>>,
+    /// `None` while running; `Some(code)` once the process ended.
+    exit: Mutex<Option<Option<u32>>>,
 }
 
-/// Starts `spec` on a new PTY. Output goes to `output`, which is closed when the process ends;
-/// input goes through the returned writer.
+impl Terminator {
+    fn exited(&self) -> bool {
+        self.exit.lock().unwrap_or_else(PoisonError::into_inner).is_some()
+    }
+
+    fn terminate(self: &Arc<Self>) {
+        if self.exited() {
+            return;
+        }
+        // The process may already be gone.
+        let _ = self.killer.lock().unwrap_or_else(PoisonError::into_inner).kill();
+        let this = self.clone();
+        let _ = thread::Builder::new().name("pty-reaper".into()).spawn(move || {
+            let deadline = Instant::now() + HANGUP_GRACE;
+            while Instant::now() < deadline {
+                if this.exited() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            this.force_kill();
+        });
+    }
+
+    #[cfg(unix)]
+    fn force_kill(&self) {
+        use rustix::process::{Pid, Signal, kill_process_group};
+        let pid = self.pid.and_then(|pid| i32::try_from(pid).ok()).and_then(Pid::from_raw);
+        if let Some(pid) = pid {
+            // The shell leads its own process group (the PTY's session).
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn force_kill(&self) {
+        // Windows: the killer already terminates the process outright.
+    }
+}
+
+/// A running local terminal. Dropping it ends the process and the output stream.
+pub struct LocalPty {
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    terminator: Arc<Terminator>,
+    output: ByteRing,
+}
+
+/// Starts `spec` on a new PTY. Output goes to `output`, which is closed once the process ended
+/// and its remaining output was drained; input goes through the returned writer.
 pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Write + Send>), PtyError> {
     let pair = native_pty_system()
         .openpty(size(spec.columns, spec.rows))
@@ -89,53 +143,90 @@ pub fn spawn(spec: SpawnSpec, output: ByteRing) -> Result<(LocalPty, Box<dyn Wri
     }
 
     let mut child = pair.slave.spawn_command(cmd).map_err(error)?;
-    // Drop our copy of the slave so the reader sees the end when the child exits.
+    // Drop our copy of the slave so the reader sees the end when the last program closes it.
     drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().map_err(error)?;
-    let writer = pair.master.take_writer().map_err(error)?;
-    let killer = child.clone_killer();
-    let pid = child.process_id();
-    let exit = Arc::new(Mutex::new(None));
+    let handles = pair
+        .master
+        .try_clone_reader()
+        .and_then(|reader| Ok((reader, pair.master.take_writer()?)));
+    let (reader, writer) = match handles {
+        Ok(handles) => handles,
+        Err(e) => {
+            reap(child.as_mut());
+            return Err(error(e));
+        }
+    };
+    let terminator = Arc::new(Terminator {
+        killer: Mutex::new(child.clone_killer()),
+        pid: child.process_id(),
+        exit: Mutex::new(None),
+    });
 
-    let mut stopper = child.clone_killer();
+    let (drained_tx, drained) = mpsc::channel::<()>();
     let reader_thread = {
-        let exit = exit.clone();
+        let (output, terminator) = (output.clone(), terminator.clone());
         move || {
-            let mut buf = vec![0u8; READ_CHUNK];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let Some(bytes) = buf.get(..n) else { break };
-                        if output.push(bytes).is_err() {
-                            // The session ended and nobody reads this terminal any more: end the
-                            // program too, or waiting for it below would never return.
-                            let _ = stopper.kill();
-                            break;
-                        }
-                    }
-                }
-            }
+            read_into(reader, &output, &terminator);
+            let _ = drained_tx.send(());
+        }
+    };
+    let waiter_thread = {
+        let (output, terminator) = (output.clone(), terminator.clone());
+        let mut child = child;
+        move || {
             let code = child.wait().ok().map(|status| status.exit_code());
-            *exit.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+            *terminator.exit.lock().unwrap_or_else(PoisonError::into_inner) = Some(code);
+            // Let the reader take what the program printed last; a background job that keeps the
+            // terminal open must not keep the session alive after its shell ended.
+            let _ = drained.recv_timeout(DRAIN_AFTER_EXIT);
             output.close();
         }
     };
     let pty = LocalPty {
         master: Mutex::new(pair.master),
-        killer: Mutex::new(killer),
-        pid,
-        exit,
+        terminator,
+        output,
     };
-    if thread::Builder::new()
+    let started = thread::Builder::new()
         .name("pty-reader".into())
         .spawn(reader_thread)
-        .is_err()
-    {
-        pty.kill();
-        return Err(PtyError("could not start the terminal's reader".into()));
+        .is_ok()
+        && thread::Builder::new()
+            .name("pty-waiter".into())
+            .spawn(waiter_thread)
+            .is_ok();
+    if !started {
+        // Dropping `pty` hangs up and, if needed, kills the program.
+        return Err(PtyError("could not start the terminal's threads".into()));
     }
     Ok((pty, writer))
+}
+
+fn read_into(mut reader: Box<dyn Read + Send>, output: &ByteRing, terminator: &Arc<Terminator>) {
+    let mut buf = vec![0u8; READ_CHUNK];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => {
+                let Some(bytes) = buf.get(..n) else { return };
+                if output.push(bytes).is_err() {
+                    // Nobody reads this terminal any more: end its program.
+                    terminator.terminate();
+                    return;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // EIO once the last program closed the terminal, or a real failure; the waiter
+            // reports the exit either way.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Ends a child that never got its threads.
+fn reap(child: &mut (dyn Child + Send + Sync)) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl LocalPty {
@@ -149,12 +240,12 @@ impl LocalPty {
 
     /// The exit code once the process ended (`Some(None)` when the system gave none).
     pub fn exit_code(&self) -> Option<Option<u32>> {
-        *self.exit.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.terminator.exit.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The working folder of the shell (not of a program it runs), when the system can tell.
     pub fn cwd(&self) -> Option<String> {
-        self.pid.and_then(process_cwd)
+        self.terminator.pid.and_then(process_cwd)
     }
 
     /// The working folder of the program in the terminal's foreground, else of its shell (TERM-15a).
@@ -173,16 +264,17 @@ impl LocalPty {
         self.cwd()
     }
 
-    /// Ends the process; the output stream then ends too.
+    /// Hangs up the process and kills it if it does not end; the output stream then ends too.
     pub fn kill(&self) {
-        // The process may already be gone.
-        let _ = self.killer.lock().unwrap_or_else(PoisonError::into_inner).kill();
+        self.terminator.terminate();
     }
 }
 
 impl Drop for LocalPty {
     fn drop(&mut self) {
-        self.kill();
+        // Closing the ring also releases a reader blocked on a full ring.
+        self.output.close();
+        self.terminator.terminate();
     }
 }
 
