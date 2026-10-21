@@ -1,0 +1,10 @@
+[package]
+name = "workspace-model"
+description = "Tabs, split panes, multi-execution and DEV mode as plain state machines (PRD §7.2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
