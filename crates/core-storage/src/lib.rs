@@ -122,10 +122,9 @@ pub fn write_text(path: &Path, contents: &str, max_bytes: u64) -> Result<(), Sto
     if contents.len() as u64 > max_bytes {
         return Err(too_large(path, max_bytes));
     }
-    // Write through a symlink to its file, and keep that file's permissions.
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mode = existing_mode(&target);
-    replace_atomically(&target, contents.as_bytes(), mode).map_err(|err| io(path, err))
+    // In place, as v0.2.15: a file the user chose keeps its owner, group, ACLs and links, and a
+    // writable file in a read-only directory can still be written (a temp + rename would not).
+    std::fs::write(path, contents).map_err(|err| io(path, err))
 }
 
 /// Appends to a text file the user chose (e.g. a session log), creating it when missing.
@@ -222,7 +221,14 @@ fn write_new(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result
     }
     #[cfg(not(unix))]
     let _ = mode;
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        // A temp file of a crashed process that had our pid (pid namespaces reuse small pids).
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            options.open(path)?
+        }
+        result => result?,
+    };
     // The umask may have narrowed the requested mode; set it exactly.
     #[cfg(unix)]
     if let Some(mode) = mode {
@@ -231,19 +237,6 @@ fn write_new(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result
     }
     file.write_all(contents)?;
     file.sync_all()
-}
-
-#[cfg(unix)]
-fn existing_mode(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .ok()
-        .map(|meta| meta.permissions().mode() & 0o7777)
-}
-
-#[cfg(not(unix))]
-fn existing_mode(_path: &Path) -> Option<u32> {
-    None
 }
 
 /// Makes a rename in `path`'s directory durable (Unix); best effort.
@@ -261,4 +254,20 @@ fn sync_parent(path: &Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_leftover_temp_file_with_our_own_name_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("plexus-core-storage-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir(&dir).unwrap();
+        let tmp = dir.join("settings.json.tmp-1-0");
+        std::fs::write(&tmp, "stale").unwrap();
+        write_new(&tmp, b"fresh", Some(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "fresh");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -194,7 +194,7 @@ fn save_removes_old_temp_files_left_by_a_crashed_writer_but_not_fresh_ones() {
 
 #[cfg(unix)]
 #[test]
-fn write_text_replaces_the_file_atomically_keeping_its_mode_and_symlink() {
+fn write_text_writes_in_place_keeping_the_files_identity_mode_and_links() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("output.txt");
@@ -205,21 +205,12 @@ fn write_text_replaces_the_file_atomically_keeping_its_mode_and_symlink() {
     let before = std::fs::metadata(&path).unwrap().ino();
     write_text(&link, "new\n", 1024).unwrap();
     let after = std::fs::metadata(&path).unwrap();
-    assert_ne!(
+    assert_eq!(
         after.ino(),
         before,
-        "a new file was renamed into place instead of truncating the old one"
+        "the same file is rewritten (owner, ACLs and hard links stay)"
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
-    assert_eq!(after.permissions().mode() & 0o777, 0o640, "the mode is kept");
-    assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
-        "the link still points at the file"
-    );
-    let mut names: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    names.sort();
-    assert_eq!(names, vec!["link.txt", "output.txt"], "no temp file is left");
+    assert_eq!(after.permissions().mode() & 0o777, 0o640);
+    assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
 }
