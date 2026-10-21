@@ -14,6 +14,7 @@ use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::frame::{Frame, FrameLine};
+use crate::guard::SequenceGuard;
 use crate::ring::{ByteRing, TryPushError};
 
 /// Most output parsed per lock hold, so the UI can always take the lock between slices (ST-2).
@@ -25,8 +26,11 @@ const STEP_BYTES: usize = 64 * 1024;
 pub const WRITE_CHUNK: usize = 64 * 1024;
 /// Bytes waiting to be written to the source (ST-3, ST-5).
 const WRITE_CAPACITY: usize = 4 * 1024 * 1024;
-/// Pastes (and keys typed behind them) waiting for the paste worker.
-const PASTE_QUEUE: usize = 32;
+/// Pastes (and keys typed behind them) waiting for the paste worker, by count and by bytes.
+const PASTE_QUEUE: usize = 4096;
+const PASTE_BYTES: usize = 64 * 1024 * 1024;
+/// Longest window title passed on (ST-9).
+pub const MAX_TITLE: usize = 4096;
 
 /// Size and history of a new session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +70,8 @@ pub enum SessionState {
 /// Callbacks into the owner of the session; they must not block.
 ///
 /// `on_event` runs on the parser thread without the terminal lock held, so it may read frames.
-/// `on_resize` runs on the thread that calls [`Session::snapshot`]. A panic in either hook ends
+/// `on_resize` runs on the thread that calls [`Session::snapshot`]; if it panics, the resulting
+/// `Ended` event is delivered on that thread too. A panic in either hook ends
 /// only this session (ST-8).
 #[derive(Clone)]
 pub struct SessionHooks {
@@ -118,9 +123,28 @@ struct Listener {
 }
 
 impl Listener {
+    /// Keeps at most one bell and the latest title per batch, so a burst never piles up events.
     fn queue(&self, event: SessionEvent) {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        match &event {
+            SessionEvent::Bell if pending.contains(&SessionEvent::Bell) => return,
+            SessionEvent::Title(_) => pending.retain(|e| !matches!(e, SessionEvent::Title(_))),
+            _ => {}
+        }
+        pending.push(event);
     }
+}
+
+/// Window titles are cut to [`MAX_TITLE`] bytes, at a character boundary (ST-9).
+fn capped_title(mut title: String) -> String {
+    if title.len() > MAX_TITLE {
+        let mut end = MAX_TITLE;
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title.truncate(end);
+    }
+    title
 }
 
 impl EventListener for Listener {
@@ -130,7 +154,7 @@ impl EventListener for Listener {
             Event::PtyWrite(reply) => {
                 let _ = self.writes.try_push(reply.as_bytes());
             }
-            Event::Title(title) => self.queue(SessionEvent::Title(title)),
+            Event::Title(title) => self.queue(SessionEvent::Title(capped_title(title))),
             Event::ResetTitle => self.queue(SessionEvent::Title(String::new())),
             Event::Bell => self.queue(SessionEvent::Bell),
             _ => {}
@@ -174,6 +198,8 @@ pub struct Session {
     pastes: SyncSender<Vec<u8>>,
     /// Pastes not fully queued yet; while any is, typed keys wait behind them.
     pasting: Arc<AtomicUsize>,
+    /// Bytes waiting for the paste worker.
+    paste_bytes: Arc<AtomicUsize>,
 }
 
 impl Session {
@@ -216,8 +242,9 @@ impl Session {
         };
         let (pastes, queued) = mpsc::sync_channel::<Vec<u8>>(PASTE_QUEUE);
         let pasting = Arc::new(AtomicUsize::new(0));
+        let paste_bytes = Arc::new(AtomicUsize::new(0));
         let paster = {
-            let pasting = pasting.clone();
+            let (pasting, paste_bytes) = (pasting.clone(), paste_bytes.clone());
             // One worker for every paste keeps pastes, and keys typed behind them, in order.
             move || {
                 for bytes in queued {
@@ -226,6 +253,7 @@ impl Session {
                             return;
                         }
                     }
+                    paste_bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
                     pasting.fetch_sub(1, Ordering::AcqRel);
                 }
             }
@@ -240,6 +268,7 @@ impl Session {
             shared,
             pastes,
             pasting,
+            paste_bytes,
         }
     }
 
@@ -266,9 +295,16 @@ impl Session {
     }
 
     fn queue_paste(&self, bytes: Vec<u8>) -> Result<(), WriteError> {
+        let size = bytes.len();
+        let queued = self.paste_bytes.fetch_add(size, Ordering::AcqRel);
+        if queued.saturating_add(size) > PASTE_BYTES {
+            self.paste_bytes.fetch_sub(size, Ordering::AcqRel);
+            return Err(WriteError::Full);
+        }
         self.pasting.fetch_add(1, Ordering::AcqRel);
         self.pastes.try_send(bytes).map_err(|e| {
             self.pasting.fetch_sub(1, Ordering::AcqRel);
+            self.paste_bytes.fetch_sub(size, Ordering::AcqRel);
             match e {
                 TrySendError::Full(_) => WriteError::Full,
                 TrySendError::Disconnected(_) => WriteError::Ended,
@@ -337,13 +373,17 @@ impl Drop for Session {
 
 fn parse_until_end(shared: &Shared, input: &ByteRing) {
     let mut parser: Processor = Processor::new();
+    let mut guard = SequenceGuard::default();
+    let mut allowed = Vec::with_capacity(STEP_BYTES);
     while let Some(first) = input.pop(STEP_BYTES) {
         let started = Instant::now();
         let mut parsed = 0;
         let mut term = shared.term.lock();
         let mut step = Some(first);
         while let Some(bytes) = step {
-            parser.advance(&mut *term, &bytes);
+            allowed.clear();
+            guard.filter(&bytes, &mut allowed);
+            parser.advance(&mut *term, &allowed);
             parsed += bytes.len();
             step = if parsed < SLICE_BYTES && started.elapsed() < SLICE_TIME {
                 input.try_pop(STEP_BYTES)

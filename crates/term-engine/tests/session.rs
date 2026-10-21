@@ -344,3 +344,22 @@ fn a_failing_resize_hook_ends_only_its_session() {
     };
     assert!(message.contains("resize failed"), "{message}");
 }
+
+#[test]
+fn many_keys_typed_during_a_long_paste_are_all_accepted_in_order() {
+    let sink = SlowSink::default();
+    let session = Session::start(config(), ByteRing::new(1024), Box::new(sink.clone()), quiet_hooks());
+    let paste = vec![b'P'; 6 * 1024 * 1024];
+    session.paste(paste.clone()).unwrap();
+    let keys: Vec<u8> = (0..300).map(|i| b'a' + (i % 26) as u8).collect();
+    for key in &keys {
+        session.write(&[*key]).unwrap();
+    }
+    let expected = [paste, keys].concat();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while sink.0.lock().unwrap().len() < expected.len() {
+        assert!(Instant::now() < deadline, "timed out waiting for the keys");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(*sink.0.lock().unwrap() == expected);
+}

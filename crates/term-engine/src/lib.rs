@@ -5,13 +5,15 @@
 //! hands the UI damage-only [`Frame`]s. Input goes the other way through a bounded write queue.
 
 mod frame;
+mod guard;
 mod ring;
 mod session;
 
 pub use alacritty_terminal::term::cell::{Cell, Flags};
 pub use alacritty_terminal::vte::ansi::{Color, NamedColor};
 pub use frame::{Frame, FrameLine};
+pub use guard::{MAX_HYPERLINK, MAX_STRING, SequenceGuard};
 pub use ring::{ByteRing, Closed, TryPushError};
 pub use session::{
-    EndReason, Session, SessionConfig, SessionEvent, SessionHooks, SessionState, WRITE_CHUNK, WriteError,
+    EndReason, MAX_TITLE, Session, SessionConfig, SessionEvent, SessionHooks, SessionState, WRITE_CHUNK, WriteError,
 };
