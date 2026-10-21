@@ -6,6 +6,7 @@
 //! `sessions.json` / `tunnels.json` read and written byte for byte like v0.2.15.
 
 pub mod file;
+pub mod form;
 pub mod library;
 pub mod model;
 pub mod shell;
