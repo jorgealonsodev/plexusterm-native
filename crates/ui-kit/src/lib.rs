@@ -14,10 +14,16 @@
 //! [`Theme::reduced_motion`] is only carried for the widgets that will.
 
 pub mod assets;
+pub mod button;
 pub mod logic;
+pub mod text_input;
 pub mod theme;
+pub mod toggle;
 
 pub use assets::{Assets, Icon};
+pub use button::Button;
 pub use logic::button::ButtonKind;
 pub use logic::dialog::DialogWidth;
+pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{Elevation, Radius, TextSize, Theme};
+pub use toggle::{Checkbox, Radio};
