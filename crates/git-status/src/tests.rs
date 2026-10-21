@@ -665,6 +665,10 @@ mod hostile_repository_tests {
 
     /// A downloaded archive with a `.git` whose config declares a filter that runs a command.
     fn hostile_repo(marker: &std::path::Path, process: bool) -> tempfile::TempDir {
+        hostile_repo_named(marker, process, "evil")
+    }
+
+    fn hostile_repo_named(marker: &std::path::Path, process: bool, name: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         git(d, &["init", "-q"]);
@@ -674,13 +678,9 @@ mod hostile_repository_tests {
         git(d, &["add", "file.txt"]);
         git(d, &["commit", "-qm", "init"]);
         let command = format!("touch '{}'; cat", marker.display());
-        let key = if process {
-            "filter.evil.process"
-        } else {
-            "filter.evil.clean"
-        };
-        git(d, &["config", key, &command]);
-        std::fs::write(d.join(".gitattributes"), "* filter=evil\n").unwrap();
+        let key = format!("filter.{name}.{}", if process { "process" } else { "clean" });
+        git(d, &["config", &key, &command]);
+        std::fs::write(d.join(".gitattributes"), format!("* filter={name}\n")).unwrap();
         // A freshly extracted file never matches the index's stat data.
         std::fs::write(d.join("file.txt"), "content\n").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
@@ -709,6 +709,23 @@ mod hostile_repository_tests {
         let marker = scratch.path().join("ran");
         let repo = hostile_repo(&marker, true);
         let _ = crate::status_of(repo.path());
+        let _ = crate::repo_of(repo.path());
         assert!(!marker.exists(), "the repository's process filter ran");
+    }
+
+    /// `-c filter.a=b.clean=cat` would set `filter.a` instead, so such a driver must stop git.
+    #[test]
+    fn a_filter_name_with_an_equals_sign_never_runs_either() {
+        for process in [false, true] {
+            let scratch = tempfile::tempdir().unwrap();
+            let marker = scratch.path().join("ran");
+            let repo = hostile_repo_named(&marker, process, "evil=x");
+            let _ = crate::status_of(repo.path());
+            let _ = crate::repo_of(repo.path());
+            assert!(
+                !marker.exists(),
+                "the repository's filter evil=x ran (process: {process})"
+            );
+        }
     }
 }

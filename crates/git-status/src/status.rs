@@ -187,12 +187,17 @@ const STATUS_ARGS: [&str; 6] = ["status", "--porcelain=v1", "-z", "--ignored=mat
 /// or `None` when git is missing or fails.
 ///
 /// A folder from elsewhere (a downloaded archive with a `.git`) must never run a program just by
-/// being listed, so the repository's fsmonitor command is off and every filter driver its config
-/// declares is replaced by a no-op: `git status` would otherwise run a `clean` or `process`
-/// filter to re-hash a file whose stat data changed.
+/// being listed, so the repository's fsmonitor command is off and every filter driver that its own
+/// config declares is replaced by a no-op: `git status` would otherwise run a `clean` or `process`
+/// filter to re-hash a file whose stat data changed. Drivers from the user's global or system
+/// config (git-lfs) stay, unless the repository redeclares them.
 fn run_git(folder: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut overrides = Vec::new();
-    for name in declared_filters(folder) {
+    for name in repository_filters(folder)? {
+        // `-c` splits at the first '=', so such a name cannot be overridden: do not run git.
+        if name.contains('=') {
+            return None;
+        }
         overrides.extend([
             "-c".to_owned(),
             format!("filter.{name}.clean=cat"),
@@ -207,24 +212,61 @@ fn run_git(folder: &Path, args: &[&str]) -> Option<Vec<u8>> {
     git_output(folder, &overrides, args)
 }
 
-/// The filter driver names the config seen from `folder` declares; reading config runs nothing.
-/// Empty when none match (`git config --get-regexp` then exits with 1) or git is missing.
-fn declared_filters(folder: &Path) -> Vec<String> {
-    let names = git_output(
+/// The filter driver names declared by config outside the user's global and system files, as seen
+/// from `folder`; reading config runs nothing. `None` when the config cannot be read (or git is too
+/// old for `--show-scope`), so nothing runs unless every repository driver is known.
+fn repository_filters(folder: &Path) -> Option<Vec<String>> {
+    let (code, out) = git_exit(
         folder,
-        &[],
-        &["config", "--name-only", "-z", "--get-regexp", r"^filter\..*\.[^.]*$"],
-    );
-    let names = names.unwrap_or_default();
-    let mut filters: Vec<String> = names
-        .split(|&b| b == 0)
-        .filter_map(|key| std::str::from_utf8(key).ok())
+        &[
+            "config",
+            "--show-scope",
+            "--name-only",
+            "-z",
+            "--get-regexp",
+            r"^filter\..*\.[^.]*$",
+        ],
+    )?;
+    match code {
+        0 => {}
+        // Nothing matched.
+        1 if out.is_empty() => return Some(Vec::new()),
+        _ => return None,
+    }
+    let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
+    let mut filters: Vec<String> = fields
+        .chunks(2)
+        .filter_map(|pair| match pair {
+            [scope, key] if !matches!(*scope, b"global" | b"system") => std::str::from_utf8(key).ok(),
+            _ => None,
+        })
         .filter_map(|key| key.strip_prefix("filter."))
         .filter_map(|rest| rest.rsplit_once('.').map(|(name, _)| name.to_owned()))
         .collect();
     filters.sort();
     filters.dedup();
-    filters
+    Some(filters)
+}
+
+/// Runs a read-only `git` in `folder`: its exit code and stdout, or `None` when git is missing.
+fn git_exit(folder: &Path, args: &[&str]) -> Option<(i32, Vec<u8>)> {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(folder)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = command.output().ok()?;
+    Some((out.status.code()?, out.stdout))
 }
 
 /// Runs `git --no-optional-locks -c core.fsmonitor=false <config> <args>` in `folder`.
