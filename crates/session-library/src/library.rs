@@ -390,9 +390,12 @@ pub fn ssh_command_of(session: &SshSession) -> String {
         SavedAuth::Key { path } => format!(" -i {}", shell_word(path)),
         _ => String::new(),
     };
+    let destination = format!("{}@{}", session.username, session.host);
+    // `--` keeps a destination that starts with `-` from being read as an ssh option.
+    let end_of_options = if destination.starts_with('-') { " --" } else { "" };
     format!(
-        "ssh -p {}{key} {}",
+        "ssh -p {}{key}{end_of_options} {}",
         session.port,
-        shell_word(&format!("{}@{}", session.username, session.host))
+        shell_word(&destination)
     )
 }

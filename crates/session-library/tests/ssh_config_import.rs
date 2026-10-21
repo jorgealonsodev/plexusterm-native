@@ -295,3 +295,20 @@ fn reads_the_ssh_config_of_a_home_folder() {
     assert_eq!(fields(&parsed.sessions[0]).1, "10.0.0.5");
     assert_eq!(decode_ssh_config(b"Host \xff"), "Host \u{fffd}");
 }
+
+/// A crafted config must neither overflow the stack nor take polynomial time: a 1 MiB alias against
+/// a pattern with many stars used to recurse once per character and backtrack on every star.
+#[test]
+fn a_huge_host_pattern_is_matched_in_bounded_time_and_stack() {
+    let alias = "a".repeat(1024 * 1024);
+    let pattern = "*a".repeat(8) + "b";
+    let config = format!("Host {alias}\n  HostName example.com\nHost {pattern}\n  User someone\n");
+    let started = std::time::Instant::now();
+    let parsed = parse_ssh_config(&config);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(parsed.sessions.len(), 1);
+}
