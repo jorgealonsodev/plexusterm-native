@@ -1,0 +1,6 @@
+granted: gentle-ai.review-integration.start/v4 created
+capture: approved
+  ## R3-neighbour-overlap-tiebreak-untested SUGGESTION crates/workspace-model/src/layout.rs:300-334 : The documented rule in neighbour that equal distances go to the pane with the larger overlap has no test. Every test case has a single closest candidate, so a regression in the epsilon comparison for equal distances would not be caught. A test where two panes sit at the same distance but overlap by different amounts would cover it.
+  ## R3-shown-unknown-and-partial-hidden-untested SUGGESTION crates/workspace-model/tests/layout.rs:189-197 : Tests for shown() cover hiding one pane, hiding all panes and hiding none. They do not cover a hidden list with an unknown pane id or a repeated id. Both depend on closed() returning a clone for unknown panes, and that behavior is not checked through shown().
+  ## R3-before-side-column-and-self-split-untested SUGGESTION crates/workspace-model/tests/layout.rs:34-44 : Side::Before is only tested with Row splits. There is no test for a Column split placing the new pane above, and none for split_pane refusing when the new id equals the pane being split. Both are handled by the code path through contains(new), but the observable behavior is not tested.
+ack: acknowledged burned review-57aab8e92b78683c

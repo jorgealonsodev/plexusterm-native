@@ -1,0 +1,5 @@
+granted: gentle-ai.review-integration.start/v4 created
+capture: completed
+capture: approved
+  ## R3-001 WARNING crates/settings-model/src/settings.rs:372-376 : Settings::parse gives the same result for a missing file and for a file it could not read. Both return the plain defaults and the caller gets no signal. The json.rs parser returns None for any serde_json error, including a UTF-8 BOM at the start of the file, an out-of-range number such as 1e999 anywhere in the file (even inside an unknown key), or nesting deeper than the recursion limit. If the app then calls to_json
+ack: acknowledged burned review-b063df4ee991be34

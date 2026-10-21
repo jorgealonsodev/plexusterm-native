@@ -1,0 +1,5 @@
+granted: gentle-ai.review-integration.start/v4 created
+capture: approved
+  ## R3-noncanonical-valid-shortcut WARNING crates/settings-model/src/capture.rs:44-66 : is_valid_shortcut and parse accept names that shortcut_from_event never produces, so such a binding can never fire. Examples: modifiers out of order ("Shift+Ctrl+A" or "Alt+Ctrl+K"), a lower-case single-character key ("Ctrl+a"), or a literal space instead of "Space". parse only checks that each modifier is a known name and appears once. It does not check the Ctrl, Alt, Shift, Meta order or the upper-case form that sh
+  ## R3-unused-declared-deps SUGGESTION crates/settings-model/Cargo.toml:9-16 : The crate declares core-storage, serde, serde_json and ui-theme as dependencies, and tempfile as a dev-dependency, but nothing in the source or tests uses them. The lib.rs doc also describes settings.json and font-catalogue support that this candidate does not contain. If the workspace lints turn on unused-crate-dependency checks, this could fail the build. Either way it adds unnecessary build coupling. Add the depen
+ack: acknowledged burned review-9bec53905f3a03ef

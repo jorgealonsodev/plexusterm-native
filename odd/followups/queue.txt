@@ -1,0 +1,8 @@
+== 2026-10-21 follow-up queue additions ==
+git-status: two-level filter.x key -> no status (fail-closed availability); test that submodule commit change still reported; remote ssh status not hardened against filters.
+local-files: UNC guard misses mixed \/ prefixes (Windows creds leak); lossy path trim (non-UTF-8 names -> wrong target); noreplace fallback undo result ignored; fallback needs hardlinks (FAT/exFAT/network fail); case-only rename refused on case-insensitive FS; xdg-mime unbounded wait; save over 0444 file succeeds (v0.2.15 refused); desktop exec %% handling.
+session-library: ssh_command_of missing `--` before destination (option injection via '-o' user) [PRIORITY]; serialize_library empty-string fallback could empty sessions.json [PRIORITY]; ssh port out of 0..65535 makes whole file unreadable (v0.2.15 accepted) [PRIORITY data]; sessions with unregistered folder hidden from tree; tests missing: chain errors, jump cleanup on delete, split/join_args.
+session-library p2: default port literals duplicated; malformed bracketed host [::1]x accepted as host; tests: port_of leading zeros, mosh non-ssh target.
+session-library p3: PasswordAnswer derives Debug over Zeroizing password (prints plaintext if logged); test folder delete jump-user note.
+session-library p4: ssh_config glob_matches recursive unbounded -> stack overflow ABORTS app on crafted config + O(n^k) backtracking [PRIORITY crash]; ProxyJump cycles imported (A<->B, nested depth); ini BOM + invalid byte -> cp1252 path breaks first header; IdentityFile none -> key auth 'none'.
+session-library p5: tunnel loader accepts destPort 0/empty destHost for local/remote; host_port double-brackets [::1]; test Storage error path.

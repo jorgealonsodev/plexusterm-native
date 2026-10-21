@@ -1,0 +1,4 @@
+granted: gentle-ai.review-integration.start/v4 created
+capture: approved
+  ## R3-watcher-timing-flaky WARNING crates/proto-sftp/tests/edit.rs:81-90 : The watcher test depends on fixed wall-clock sleeps. It waits 80 ms, then 120 ms, then 80 ms against a 20 ms poll interval, on a current-thread runtime, and asserts exact save counts after each wait. On a loaded CI machine the watcher may not have taken its first look or noticed the second write within 120 ms, so the count-equals-1 assertion can fail even when the code is correct. The other async waits in this candid
+ack: acknowledged burned review-319ca06427d6e66d
