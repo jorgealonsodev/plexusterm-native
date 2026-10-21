@@ -91,8 +91,42 @@ pub fn summarize(samples: &mut [u64]) -> Option<Summary> {
     })
 }
 
+/// The `latency_report` arguments: `<folder> [<from µs> <to µs>]`. A window given only in part,
+/// a window that is not two integers, or extra arguments are errors, never silently ignored.
+pub fn parse_report_args(args: &[String]) -> Result<(std::path::PathBuf, Option<(u128, u128)>), String> {
+    const USAGE: &str = "usage: latency_report <folder> [<from µs> <to µs>]";
+    match args {
+        [folder] => Ok((folder.into(), None)),
+        [folder, from, to] => match (from.parse(), to.parse()) {
+            (Ok(from), Ok(to)) => Ok((folder.into(), Some((from, to)))),
+            _ => Err("latency_report: the window is two integers (µs since the epoch)".to_owned()),
+        },
+        _ => Err(USAGE.to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_arguments_take_a_folder_and_an_optional_whole_window() {
+        let args = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse_report_args(&args(&["logs"])), Ok(("logs".into(), None)));
+        assert_eq!(
+            parse_report_args(&args(&["logs", "10", "20"])),
+            Ok(("logs".into(), Some((10, 20))))
+        );
+        assert!(
+            parse_report_args(&args(&["logs", "10"])).is_err(),
+            "half a window is an error"
+        );
+        assert!(
+            parse_report_args(&args(&["logs", "10", "20", "30"])).is_err(),
+            "extra arguments are an error"
+        );
+        assert!(parse_report_args(&args(&["logs", "x", "20"])).is_err());
+        assert!(parse_report_args(&args(&[])).is_err());
+    }
+
     use super::*;
 
     #[test]

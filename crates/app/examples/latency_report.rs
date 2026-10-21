@@ -5,14 +5,13 @@
 //! with a window (µs since the epoch) only intervals that start and end inside it count, e.g.
 //! while a `cat` of a large file runs. The first frame (interval 0) never counts.
 
-use std::path::Path;
 use std::process::ExitCode;
 
 #[path = "../src/latency/stats.rs"]
 #[allow(dead_code, reason = "the line writers are used by the app, not by this report")]
 mod stats;
 
-use stats::{Summary, frame_intervals, key_latencies, summarize};
+use stats::{Summary, frame_intervals, key_latencies, parse_report_args, summarize};
 
 fn ms(us: u64) -> String {
     #[allow(clippy::cast_precision_loss, reason = "µs values are far below 2^52")]
@@ -36,19 +35,12 @@ fn print(label: &str, summary: Option<Summary>, extra: &str) {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(folder) = args.first().map(Path::new) else {
-        eprintln!("usage: latency_report <folder> [<from µs> <to µs>]");
-        return ExitCode::FAILURE;
-    };
-    let window: Option<(u128, u128)> = match (args.get(1), args.get(2)) {
-        (Some(from), Some(to)) => match (from.parse(), to.parse()) {
-            (Ok(from), Ok(to)) => Some((from, to)),
-            _ => {
-                eprintln!("latency_report: the window is two integers (µs since the epoch)");
-                return ExitCode::FAILURE;
-            }
-        },
-        _ => None,
+    let (folder, window) = match parse_report_args(&args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
     };
     let read = |name: &str| std::fs::read_to_string(folder.join(name)).unwrap_or_default();
 
