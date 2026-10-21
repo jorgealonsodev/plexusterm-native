@@ -1850,6 +1850,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "project-settings"
+version = "0.1.0"
+dependencies = [
+ "core-storage",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "proto-pty"
 version = "0.1.0"
 dependencies = [
