@@ -256,7 +256,7 @@ fn defaults_invalid_values_and_keeps_unknown_keys_apart() {
     assert_eq!(parsed.unknown_keys().collect::<Vec<_>>(), ["colour"]);
     assert_eq!(as_json(&parsed), default_json_with(json!({ "colour": "dark" })));
     assert_eq!(parse(r#"{"fontSize":null}"#).font_size, 14);
-    // 1e999 is Infinity in JavaScript; serde_json refuses it, so the whole file reads as defaults.
+    // 1e999 is Infinity in JavaScript, which is not finite, so the size is the default.
     assert_eq!(parse(r#"{"fontSize":1e999}"#).font_size, 14);
 }
 
@@ -804,5 +804,22 @@ fn sharing_keeps_only_relay_and_viewer_urls_of_their_schemes() {
     assert_eq!(
         [s.share_relay_url.as_str(), s.share_viewer_origin.as_str()],
         ["", "https://v.example"]
+    );
+}
+
+// JSON.parse reads 1e999 as Infinity, so v0.2.15 kept the rest of such a file; a native parse
+// failure would reset every setting and the next save would write the defaults over them.
+#[test]
+fn a_number_too_large_for_a_double_never_resets_the_whole_file() {
+    let parsed = parse(r#"{"fontSize": 1e999, "uiFontSize": 15, "colour": "red", "big": -1e999, "name": "1e999"}"#);
+    assert_eq!(parsed.font_size, 14, "Infinity is not finite: the default, as v0.2.15");
+    assert_eq!(parsed.ui_font_size, parse(r#"{"uiFontSize": 15}"#).ui_font_size);
+    assert_eq!(parsed.unknown_keys().collect::<Vec<_>>(), ["colour", "big", "name"]);
+    let written = as_json(&parsed);
+    assert_eq!(written["colour"], "red");
+    assert_eq!(written["big"], Value::Null, "JSON.stringify writes Infinity as null");
+    assert_eq!(
+        written["name"], "1e999",
+        "a string that looks like a number is left alone"
     );
 }
