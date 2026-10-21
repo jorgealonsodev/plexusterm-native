@@ -130,21 +130,38 @@ impl Terminator {
         };
         let this = self.clone();
         let _ = thread::Builder::new().name("pty-reaper".into()).spawn(move || {
+            // The grace period covers the foreground job too: a shell passes the hang-up on and
+            // exits at once, while its job may still be saving.
             let deadline = Instant::now() + HANGUP_GRACE;
-            while Instant::now() < deadline && !this.exited() {
+            while Instant::now() < deadline && !(this.exited() && !this.job_running(foreground)) {
                 thread::sleep(Duration::from_millis(20));
             }
             this.force_kill(foreground);
         });
     }
 
+    fn shell_pid(&self) -> Option<i32> {
+        self.pid.and_then(|pid| i32::try_from(pid).ok())
+    }
+
+    /// Whether the captured foreground job (other than the shell) still runs in this terminal's session.
+    fn job_running(&self, foreground: Option<i32>) -> bool {
+        match (foreground, self.shell_pid()) {
+            (Some(group), Some(shell)) if group != shell => group_in_session(group, shell),
+            _ => false,
+        }
+    }
+
     #[cfg(unix)]
     fn force_kill(&self, foreground: Option<i32>) {
         use rustix::process::{Pid, Signal, kill_process_group};
         let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
-        let shell = self.pid.and_then(|pid| i32::try_from(pid).ok());
-        // A job that ignores the hang-up outlives its shell; its group stays valid while it runs.
-        if let Some(group) = foreground.filter(|group| Some(*group) != shell).and_then(Pid::from_raw) {
+        let shell = self.shell_pid();
+        // A job that ignores the hang-up outlives its shell. Its group is checked to still belong to
+        // this terminal's session, so an id reused by an unrelated group is never signalled.
+        if self.job_running(foreground)
+            && let Some(group) = foreground.and_then(Pid::from_raw)
+        {
             let _ = kill_process_group(group, Signal::KILL);
         }
         if !self.reap_if_done(child.as_mut())
@@ -428,6 +445,30 @@ fn expand_home(path: &str) -> PathBuf {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
+}
+
+/// Whether a live process leads `group` inside the session `session` (the shell's pid).
+#[cfg(target_os = "linux")]
+fn group_in_session(group: i32, session: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{group}/stat")) else {
+        return false;
+    };
+    // After the command name: state, ppid, pgrp, session, ...
+    let mut fields = stat
+        .rsplit_once(')')
+        .map(|(_, rest)| rest)
+        .unwrap_or_default()
+        .split_whitespace();
+    let state = fields.next();
+    let pgrp = fields.nth(1).and_then(|f| f.parse::<i32>().ok());
+    let sid = fields.next().and_then(|f| f.parse::<i32>().ok());
+    state.is_some_and(|s| s != "Z") && pgrp == Some(group) && sid == Some(session)
+}
+
+/// Without `/proc` the session cannot be checked; the group is assumed to still be the job's.
+#[cfg(not(target_os = "linux"))]
+fn group_in_session(_group: i32, _session: i32) -> bool {
+    true
 }
 
 #[cfg(target_os = "linux")]

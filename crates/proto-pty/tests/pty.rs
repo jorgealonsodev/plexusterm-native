@@ -395,3 +395,30 @@ fn output_printed_before_the_exit_survives_a_slow_reader() {
     assert!(out.contains("TAIL"));
     assert!(pty.exit_code().is_some());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_foreground_job_gets_its_grace_period_to_save_on_hang_up() {
+    let marker = std::env::temp_dir().join(format!("plexus-pty-grace-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let job = format!(
+        "sh -c 'trap \"sleep 0.5; echo saved > {}; exit 0\" HUP; printf READY; while :; do sleep 0.1; done'; true",
+        marker.display()
+    );
+    let spec = SpawnSpec {
+        program: Some("/bin/bash".into()),
+        args: vec!["--norc".into(), "-i".into(), "-c".into(), job],
+        columns: 80,
+        rows: 24,
+        ..SpawnSpec::default()
+    };
+    let (pty, _w, ring) = start(spec);
+    read_until(&ring, "READY");
+    pty.kill();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "the job was killed before it could save");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_file(&marker);
+}
