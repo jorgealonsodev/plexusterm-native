@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +25,8 @@ const STEP_BYTES: usize = 64 * 1024;
 pub const WRITE_CHUNK: usize = 64 * 1024;
 /// Bytes waiting to be written to the source (ST-3, ST-5).
 const WRITE_CAPACITY: usize = 4 * 1024 * 1024;
+/// Pastes (and keys typed behind them) waiting for the paste worker.
+const PASTE_QUEUE: usize = 32;
 
 /// Size and history of a new session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +37,7 @@ pub struct SessionConfig {
     pub scrollback: usize,
 }
 
-/// Something the UI should know about; sent from the session's threads.
+/// Something the UI should know about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
     /// New output is ready to paint; sent once per batch, not per byte.
@@ -50,7 +53,7 @@ pub enum SessionEvent {
 pub enum EndReason {
     /// The source ended (the shell exited, the connection closed).
     SourceClosed,
-    /// The session failed (a panic in its threads); only this session is affected (ST-8).
+    /// The session failed (a panic in its threads or hooks); only this session is affected (ST-8).
     Failed(String),
 }
 
@@ -60,7 +63,11 @@ pub enum SessionState {
     Ended(EndReason),
 }
 
-/// Callbacks into the owner of the session. Both run on session threads and must not block.
+/// Callbacks into the owner of the session; they must not block.
+///
+/// `on_event` runs on the parser thread without the terminal lock held, so it may read frames.
+/// `on_resize` runs on the thread that calls [`Session::snapshot`]. A panic in either hook ends
+/// only this session (ST-8).
 #[derive(Clone)]
 pub struct SessionHooks {
     pub on_event: Arc<dyn Fn(SessionEvent) + Send + Sync>,
@@ -71,7 +78,7 @@ pub struct SessionHooks {
 /// Returned when input cannot be queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// The source is not consuming input and the write queue is full.
+    /// The source is not consuming input and the queue is full.
     Full,
     Ended,
 }
@@ -103,10 +110,17 @@ impl GridSize {
     }
 }
 
-/// Forwards terminal events: replies go back to the source, the rest to the owner.
+/// Forwards terminal events: replies go straight back to the source; the rest wait until the
+/// parser releases the terminal lock, so owner hooks never run under it.
 struct Listener {
     writes: ByteRing,
-    on_event: Arc<dyn Fn(SessionEvent) + Send + Sync>,
+    pending: Arc<Mutex<Vec<SessionEvent>>>,
+}
+
+impl Listener {
+    fn queue(&self, event: SessionEvent) {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).push(event);
+    }
 }
 
 impl EventListener for Listener {
@@ -116,9 +130,9 @@ impl EventListener for Listener {
             Event::PtyWrite(reply) => {
                 let _ = self.writes.try_push(reply.as_bytes());
             }
-            Event::Title(title) => (self.on_event)(SessionEvent::Title(title)),
-            Event::ResetTitle => (self.on_event)(SessionEvent::Title(String::new())),
-            Event::Bell => (self.on_event)(SessionEvent::Bell),
+            Event::Title(title) => self.queue(SessionEvent::Title(title)),
+            Event::ResetTitle => self.queue(SessionEvent::Title(String::new())),
+            Event::Bell => self.queue(SessionEvent::Bell),
             _ => {}
         }
     }
@@ -126,6 +140,9 @@ impl EventListener for Listener {
 
 struct Shared {
     term: FairMutex<Term<Listener>>,
+    events: Arc<Mutex<Vec<SessionEvent>>>,
+    input: ByteRing,
+    writes: ByteRing,
     dirty: AtomicBool,
     pending_resize: Mutex<Option<(u16, u16)>>,
     state: Mutex<SessionState>,
@@ -133,19 +150,30 @@ struct Shared {
 }
 
 impl Shared {
+    /// Records the first end only; a later one (the parser draining a ring closed by a failure) is ignored.
     fn end(&self, reason: EndReason) {
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = SessionState::Ended(reason.clone());
-        // The owner's hook may itself be what failed; it must not take the parser thread down twice.
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if *state != SessionState::Running {
+                return;
+            }
+            *state = SessionState::Ended(reason.clone());
+        }
+        // Nothing reads an ended session's output and nothing more may reach its source.
+        self.input.close();
+        self.writes.close();
+        // The owner's hook may itself be what failed; it must not take this thread down twice.
         let _ = catch_unwind(AssertUnwindSafe(|| (self.hooks.on_event)(SessionEvent::Ended(reason))));
     }
 }
 
-/// One terminal session: a parser thread fed by a [`ByteRing`] and a writer thread draining
-/// input to the source (PRD §6.3 ST-1..ST-6, ST-8). The UI only takes [`Frame`]s.
+/// One terminal session: a parser thread fed by a [`ByteRing`], a writer thread draining input
+/// to the source and a paste worker (PRD §6.3 ST-1..ST-6, ST-8). The UI only takes [`Frame`]s.
 pub struct Session {
     shared: Arc<Shared>,
-    input: ByteRing,
-    writes: ByteRing,
+    pastes: SyncSender<Vec<u8>>,
+    /// Pastes not fully queued yet; while any is, typed keys wait behind them.
+    pasting: Arc<AtomicUsize>,
 }
 
 impl Session {
@@ -158,13 +186,17 @@ impl Session {
             osc52: Osc52::Disabled,
             ..Config::default()
         };
+        let events = Arc::new(Mutex::new(Vec::new()));
         let listener = Listener {
             writes: writes.clone(),
-            on_event: hooks.on_event.clone(),
+            pending: events.clone(),
         };
         let term = Term::new(term_config, &GridSize::new(config.columns, config.rows), listener);
         let shared = Arc::new(Shared {
             term: FairMutex::new(term),
+            events,
+            input: input.clone(),
+            writes: writes.clone(),
             dirty: AtomicBool::new(false),
             pending_resize: Mutex::new(None),
             state: Mutex::new(SessionState::Running),
@@ -172,50 +204,76 @@ impl Session {
         });
 
         let parser = {
-            let (shared, input) = (shared.clone(), input.clone());
+            let shared = shared.clone();
             move || match catch_unwind(AssertUnwindSafe(|| parse_until_end(&shared, &input))) {
                 Ok(()) => shared.end(EndReason::SourceClosed),
-                Err(panic) => {
-                    // Stop the source too: nobody reads its output any more.
-                    input.close();
-                    shared.end(EndReason::Failed(panic_message(panic.as_ref())));
-                }
+                Err(panic) => shared.end(EndReason::Failed(panic_message(panic.as_ref()))),
             }
         };
         let writer = {
             let writes = writes.clone();
             move || drain_writes(&writes, output)
         };
-        if !(spawn_named("term-parser", parser) && spawn_named("term-writer", writer)) {
-            input.close();
-            writes.close();
+        let (pastes, queued) = mpsc::sync_channel::<Vec<u8>>(PASTE_QUEUE);
+        let pasting = Arc::new(AtomicUsize::new(0));
+        let paster = {
+            let pasting = pasting.clone();
+            // One worker for every paste keeps pastes, and keys typed behind them, in order.
+            move || {
+                for bytes in queued {
+                    for chunk in bytes.chunks(WRITE_CHUNK) {
+                        if writes.push(chunk).is_err() {
+                            return;
+                        }
+                    }
+                    pasting.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        };
+        let started = spawn_named("term-parser", parser)
+            && spawn_named("term-writer", writer)
+            && spawn_named("term-paste", paster);
+        if !started {
             shared.end(EndReason::Failed("could not start the session's threads".to_owned()));
         }
-        Self { shared, input, writes }
+        Self {
+            shared,
+            pastes,
+            pasting,
+        }
     }
 
-    /// Queues typed input without ever waiting (ST-5).
+    /// Queues typed input without ever waiting (ST-5); keys typed during a paste go after it.
     pub fn write(&self, bytes: &[u8]) -> Result<(), WriteError> {
-        if !matches!(self.state(), SessionState::Running) {
+        if self.state() != SessionState::Running {
             return Err(WriteError::Ended);
         }
-        self.writes.try_push(bytes).map_err(|e| match e {
+        if self.pasting.load(Ordering::Acquire) > 0 {
+            return self.queue_paste(bytes.to_vec());
+        }
+        self.shared.writes.try_push(bytes).map_err(|e| match e {
             TryPushError::Full => WriteError::Full,
             TryPushError::Closed => WriteError::Ended,
         })
     }
 
-    /// Queues a paste of any size from a helper thread, in order, written in 64 KiB chunks.
-    pub fn paste(&self, bytes: Vec<u8>) {
-        let writes = self.writes.clone();
-        // Without a thread the paste is lost like any input to an ended session.
-        let _ = spawn_named("term-paste", move || {
-            for chunk in bytes.chunks(WRITE_CHUNK) {
-                if writes.push(chunk).is_err() {
-                    return;
-                }
+    /// Queues a paste of any size without waiting; it is written in order, in 64 KiB chunks.
+    pub fn paste(&self, bytes: Vec<u8>) -> Result<(), WriteError> {
+        if self.state() != SessionState::Running {
+            return Err(WriteError::Ended);
+        }
+        self.queue_paste(bytes)
+    }
+
+    fn queue_paste(&self, bytes: Vec<u8>) -> Result<(), WriteError> {
+        self.pasting.fetch_add(1, Ordering::AcqRel);
+        self.pastes.try_send(bytes).map_err(|e| {
+            self.pasting.fetch_sub(1, Ordering::AcqRel);
+            match e {
+                TrySendError::Full(_) => WriteError::Full,
+                TrySendError::Disconnected(_) => WriteError::Ended,
             }
-        });
+        })
     }
 
     /// Records a new size; applied once, with the last size, by the next [`Session::snapshot`] (ST-6).
@@ -251,7 +309,10 @@ impl Session {
         term.reset_damage();
         drop(term);
         if let Some((columns, rows)) = resize {
-            (self.shared.hooks.on_resize)(columns, rows);
+            let on_resize = &self.shared.hooks.on_resize;
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| on_resize(columns, rows))) {
+                self.shared.end(EndReason::Failed(panic_message(panic.as_ref())));
+            }
         }
         Some(frame)
     }
@@ -268,9 +329,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Ends both threads; the source sees its ring closed and stops reading.
-        self.input.close();
-        self.writes.close();
+        // Ends the threads; the source sees its ring closed and stops reading.
+        self.shared.input.close();
+        self.shared.writes.close();
     }
 }
 
@@ -291,6 +352,10 @@ fn parse_until_end(shared: &Shared, input: &ByteRing) {
             };
         }
         drop(term);
+        let events = std::mem::take(&mut *shared.events.lock().unwrap_or_else(PoisonError::into_inner));
+        for event in events {
+            (shared.hooks.on_event)(event);
+        }
         if !shared.dirty.swap(true, Ordering::AcqRel) {
             (shared.hooks.on_event)(SessionEvent::Wakeup);
         }
@@ -308,6 +373,16 @@ fn drain_writes(writes: &ByteRing, mut output: Box<dyn Write + Send>) {
 }
 
 fn read_frame(term: &Term<Listener>, damaged: Option<&[usize]>) -> Frame {
+    // One flag per row keeps the per-cell check constant time while the lock is held (ST-2).
+    let wanted = damaged.map(|rows| {
+        let mut flags = vec![false; term.screen_lines()];
+        for &row in rows {
+            if let Some(flag) = flags.get_mut(row) {
+                *flag = true;
+            }
+        }
+        flags
+    });
     let content = term.renderable_content();
     let offset = i32::try_from(content.display_offset).unwrap_or(i32::MAX);
     let mut lines: Vec<FrameLine> = Vec::new();
@@ -315,7 +390,10 @@ fn read_frame(term: &Term<Listener>, damaged: Option<&[usize]>) -> Frame {
         let Ok(row) = usize::try_from(indexed.point.line.0.saturating_add(offset)) else {
             continue;
         };
-        if damaged.is_some_and(|rows| !rows.contains(&row)) {
+        if wanted
+            .as_ref()
+            .is_some_and(|rows| !rows.get(row).copied().unwrap_or(false))
+        {
             continue;
         }
         match lines.last_mut() {

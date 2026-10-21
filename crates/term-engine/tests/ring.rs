@@ -2,7 +2,7 @@
 //! never drops or reorders output.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use term_engine::{ByteRing, Closed};
 
@@ -34,7 +34,12 @@ fn a_full_ring_blocks_the_writer_instead_of_growing_or_dropping() {
         let ring = ring.clone();
         thread::spawn(move || ring.push(&(0..32u8).collect::<Vec<_>>()))
     };
-    thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ring.len() < 8 {
+        assert!(Instant::now() < deadline, "the writer never filled the ring");
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(Duration::from_millis(20));
     assert_eq!(ring.len(), 8, "the writer filled the ring and waits for room");
     assert!(!writer.is_finished(), "the writer is held back");
 

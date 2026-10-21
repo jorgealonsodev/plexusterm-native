@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use term_engine::{ByteRing, EndReason, Frame, Session, SessionConfig, SessionEvent, SessionHooks, SessionState};
+use term_engine::{
+    ByteRing, EndReason, Frame, Session, SessionConfig, SessionEvent, SessionHooks, SessionState, WriteError,
+};
 
 /// Records every write call, so tests can check order and chunk sizes.
 #[derive(Clone, Default)]
@@ -143,7 +145,7 @@ fn keystrokes_reach_the_source_in_order() {
 fn large_pastes_are_written_in_chunks_of_at_most_64_kib_and_keep_their_order() {
     let h = start();
     let paste: Vec<u8> = (0..200 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
-    h.session.paste(paste.clone());
+    h.session.paste(paste.clone()).unwrap();
     wait_until("the whole paste", || h.sink.bytes().len() == paste.len());
     assert_eq!(h.sink.bytes(), paste);
     assert!(h.sink.writes().iter().all(|&n| n <= 64 * 1024), "{:?}", h.sink.writes());
@@ -237,4 +239,108 @@ fn a_flood_keeps_memory_bounded_and_ends_on_the_newest_screen() {
         let screen = h.session.full_frame();
         (0..5).any(|r| screen.text_of_row(r).trim_end() == "END")
     });
+}
+
+/// A source that consumes input slowly, so the write queue fills up.
+#[derive(Clone, Default)]
+struct SlowSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SlowSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        thread::sleep(Duration::from_micros(300));
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn quiet_hooks() -> SessionHooks {
+    SessionHooks {
+        on_event: Arc::new(|_| {}),
+        on_resize: Arc::new(|_, _| {}),
+    }
+}
+
+fn config() -> SessionConfig {
+    SessionConfig {
+        columns: 20,
+        rows: 5,
+        scrollback: 100,
+    }
+}
+
+#[test]
+fn consecutive_pastes_and_keys_reach_a_slow_source_in_order() {
+    let sink = SlowSink::default();
+    let session = Session::start(config(), ByteRing::new(1024), Box::new(sink.clone()), quiet_hooks());
+    let first = vec![b'A'; 6 * 1024 * 1024];
+    let second = vec![b'B'; 6 * 1024 * 1024];
+    session.paste(first.clone()).unwrap();
+    session.paste(second.clone()).unwrap();
+    session.write(b"\r").unwrap();
+    let expected = [first, second, b"\r".to_vec()].concat();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while sink.0.lock().unwrap().len() < expected.len() {
+        assert!(Instant::now() < deadline, "timed out waiting for the pastes");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        *sink.0.lock().unwrap() == expected,
+        "pastes and the key after them arrive whole and in order"
+    );
+}
+
+#[test]
+fn input_after_the_end_is_refused_and_never_written() {
+    let h = start();
+    h.ring.close();
+    wait_until("the end", || {
+        h.session.state() == SessionState::Ended(EndReason::SourceClosed)
+    });
+    assert_eq!(h.session.paste(b"late paste".to_vec()), Err(WriteError::Ended));
+    assert_eq!(h.session.write(b"late key"), Err(WriteError::Ended));
+    thread::sleep(Duration::from_millis(20));
+    assert!(h.sink.bytes().is_empty());
+}
+
+#[test]
+fn hooks_run_without_the_terminal_lock_so_they_may_read_the_screen() {
+    let slot: Arc<std::sync::OnceLock<std::sync::Weak<Session>>> = Arc::default();
+    let seen = Arc::new(Mutex::new(None));
+    let hooks = SessionHooks {
+        on_event: Arc::new({
+            let (slot, seen) = (slot.clone(), seen.clone());
+            move |event| {
+                if let (SessionEvent::Title(_), Some(session)) = (event, slot.get().and_then(std::sync::Weak::upgrade))
+                {
+                    *seen.lock().unwrap() = Some(session.full_frame().text_of_row(0));
+                }
+            }
+        }),
+        on_resize: Arc::new(|_, _| {}),
+    };
+    let ring = ByteRing::new(1024);
+    let session = Arc::new(Session::start(config(), ring.clone(), Box::new(Sink::default()), hooks));
+    slot.set(Arc::downgrade(&session)).unwrap();
+    ring.push(b"seen\x1b]2;title\x07").unwrap();
+    wait_until("the hook to read the screen", || seen.lock().unwrap().is_some());
+    assert_eq!(seen.lock().unwrap().as_deref().map(str::trim_end), Some("seen"));
+}
+
+#[test]
+fn a_failing_resize_hook_ends_only_its_session() {
+    let hooks = SessionHooks {
+        on_event: Arc::new(|_| {}),
+        on_resize: Arc::new(|_, _| panic!("resize failed")),
+    };
+    let session = Session::start(config(), ByteRing::new(1024), Box::new(Sink::default()), hooks);
+    session.request_resize(80, 24);
+    let frame = session.snapshot();
+    assert!(frame.is_some(), "the frame of the resize is still returned");
+    let SessionState::Ended(EndReason::Failed(message)) = session.state() else {
+        panic!("{:?}", session.state())
+    };
+    assert!(message.contains("resize failed"), "{message}");
 }
