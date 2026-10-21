@@ -158,7 +158,13 @@ pub fn status_of(folder: &Path) -> Vec<StatusEntry> {
     let Some(prefix) = run_git(folder, &["rev-parse", "--show-prefix"]) else {
         return Vec::new();
     };
-    let Some(status) = run_git(folder, &STATUS_ARGS) else {
+    // A submodule's dirtiness would come from a git run inside it, with its own config and
+    // filters; its checked-out commit is still compared.
+    let mut args: Vec<&str> = Vec::with_capacity(STATUS_ARGS.len() + 1);
+    args.extend_from_slice(&STATUS_ARGS[..1]);
+    args.push("--ignore-submodules=dirty");
+    args.extend_from_slice(&STATUS_ARGS[1..]);
+    let Some(status) = run_git(folder, &args) else {
         return Vec::new();
     };
     let prefix = String::from_utf8_lossy(&prefix);
@@ -224,7 +230,8 @@ fn repository_filters(folder: &Path) -> Option<Vec<String>> {
             "--name-only",
             "-z",
             "--get-regexp",
-            r"^filter\..*\.[^.]*$",
+            // Only the prefix: `.` need not match bytes that are not text in the locale.
+            r"^filter\.",
         ],
     )?;
     match code {
@@ -233,16 +240,18 @@ fn repository_filters(folder: &Path) -> Option<Vec<String>> {
         1 if out.is_empty() => return Some(Vec::new()),
         _ => return None,
     }
-    let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
-    let mut filters: Vec<String> = fields
-        .chunks(2)
-        .filter_map(|pair| match pair {
-            [scope, key] if !matches!(*scope, b"global" | b"system") => std::str::from_utf8(key).ok(),
-            _ => None,
-        })
-        .filter_map(|key| key.strip_prefix("filter."))
-        .filter_map(|rest| rest.rsplit_once('.').map(|(name, _)| name.to_owned()))
-        .collect();
+    // `scope NUL key NUL` per entry; anything the overrides could not name stops git.
+    let body = out.strip_suffix(&[0]).unwrap_or(&out);
+    let fields: Vec<&[u8]> = body.split(|&b| b == 0).collect();
+    let mut filters = Vec::new();
+    for pair in fields.chunks(2) {
+        let [scope, key] = pair else { return None };
+        if matches!(*scope, b"global" | b"system") {
+            continue;
+        }
+        let rest = std::str::from_utf8(key).ok()?.strip_prefix("filter.")?;
+        filters.push(rest.rsplit_once('.')?.0.to_owned());
+    }
     filters.sort();
     filters.dedup();
     Some(filters)

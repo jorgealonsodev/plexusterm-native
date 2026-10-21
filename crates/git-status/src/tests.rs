@@ -653,9 +653,13 @@ mod ssh_tests {
 mod hostile_repository_tests {
     use std::process::Command;
 
-    fn git(dir: &std::path::Path, args: &[&str]) {
+    fn git<S: AsRef<std::ffi::OsStr>>(dir: &std::path::Path, args: &[S]) {
+        let args: Vec<&std::ffi::OsStr> = args.iter().map(AsRef::as_ref).collect();
+        // The fixtures ignore the developer's own git config, so they build the same everywhere.
         let ok = Command::new("git")
-            .args(args)
+            .args(&args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(dir)
             .status()
             .unwrap()
@@ -727,5 +731,101 @@ mod hostile_repository_tests {
                 "the repository's filter evil=x ran (process: {process})"
             );
         }
+    }
+
+    /// A filter named with bytes that are not UTF-8 still has to stop git.
+    #[test]
+    fn a_filter_name_that_is_not_utf8_never_runs() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("ran");
+        let repo = hostile_repo(&marker, false);
+        let d = repo.path();
+        git(d, &["config", "--unset", "filter.evil.clean"]);
+        let command = format!("touch '{}'; cat", marker.display());
+        let key = OsStr::from_bytes(b"filter.e\xffvil.clean");
+        git(d, &[OsStr::new("config"), key, OsStr::new(&command)]);
+        std::fs::write(d.join(".gitattributes"), b"* filter=e\xffvil\n").unwrap();
+        let _ = crate::status_of(d);
+        let _ = crate::repo_of(d);
+        assert!(!marker.exists(), "the repository's non-UTF-8 filter ran");
+    }
+
+    /// A submodule's own config can declare a filter under a name the superproject never shows.
+    #[test]
+    fn a_submodule_filter_never_runs() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("ran");
+        let inner = scratch.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        git(&inner, &["init", "-q"]);
+        std::fs::write(inner.join("file.txt"), "content\n").unwrap();
+        git(&inner, &["add", "file.txt"]);
+        git(
+            &inner,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        let outer = tempfile::tempdir().unwrap();
+        let d = outer.path();
+        git(d, &["init", "-q"]);
+        git(
+            d,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                inner.to_str().unwrap(),
+                "sub",
+            ],
+        );
+        git(
+            d,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "sub",
+            ],
+        );
+        let sub = d.join("sub");
+        let command = format!("touch '{}'; cat", marker.display());
+        git(&sub, &["config", "filter.subevil.clean", &command]);
+        std::fs::write(sub.join(".gitattributes"), "* filter=subevil\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(sub.join("file.txt"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let _ = crate::status_of(d);
+        assert!(!marker.exists(), "the submodule's filter ran");
+    }
+
+    /// Neutralising a repository's filters still lists its status.
+    #[test]
+    fn a_repository_with_its_own_filter_still_reports_its_status() {
+        let scratch = tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("ran");
+        let repo = hostile_repo(&marker, false);
+        std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
+        let paths: Vec<String> = crate::status_of(repo.path()).into_iter().map(|e| e.path).collect();
+        assert!(paths.contains(&"new.txt".to_owned()), "{paths:?}");
+        assert!(crate::repo_of(repo.path()).is_some());
+        assert!(!marker.exists());
     }
 }
