@@ -1,0 +1,10 @@
+[package]
+name = "ui-theme"
+description = "Color schemes and the interface tokens derived from them (PRD §8.1, Appendix C)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

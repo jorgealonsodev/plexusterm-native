@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/jorgealonsodev/plexusterm-native"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# ST-12: no panicking shortcuts outside tests (clippy.toml allows them in tests).
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+await_holding_lock = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+# ST-8: a failing session must end only its own pane, so panics unwind to the session supervisor.
+panic = "unwind"
