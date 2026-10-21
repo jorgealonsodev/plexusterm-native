@@ -129,6 +129,13 @@ fn window_titles_are_capped_at_4_kib() {
     wait_for("the output after the title", || {
         session.full_frame().text_of_row(0).starts_with("done")
     });
+    wait_for("the title event", || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Title(_)))
+    });
     let titles: Vec<usize> = events
         .lock()
         .unwrap()
@@ -220,6 +227,14 @@ fn only_the_latest_title_of_a_batch_is_reported() {
     ring.push(b"\x1b]2;first\x07\x1b]2;second\x07\x1b]2;third\x07done")
         .unwrap();
     wait_for("the text", || session.full_frame().text_of_row(0).starts_with("done"));
+    // Events are emitted right after the batch releases the terminal, so wait for them too.
+    wait_for("the title event", || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Title(_)))
+    });
     let titles: Vec<String> = events
         .lock()
         .unwrap()

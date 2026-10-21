@@ -364,12 +364,15 @@ fn many_keys_typed_during_a_long_paste_are_all_accepted_in_order() {
     assert!(*sink.0.lock().unwrap() == expected);
 }
 
-/// A source that never consumes input, so pastes stay queued.
-struct StuckSink;
+/// A source that consumes nothing until released, so pastes stay queued.
+#[derive(Clone, Default)]
+struct StuckSink(Arc<std::sync::atomic::AtomicBool>);
 impl Write for StuckSink {
-    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-        thread::sleep(Duration::from_secs(3600));
-        Ok(0)
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        while !self.0.load(std::sync::atomic::Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -378,7 +381,9 @@ impl Write for StuckSink {
 
 #[test]
 fn pastes_beyond_the_byte_budget_are_refused_and_the_budget_is_refunded() {
-    let session = Session::start(config(), ByteRing::new(1024), Box::new(StuckSink), quiet_hooks());
+    let sink = StuckSink::default();
+    let session = Session::start(config(), ByteRing::new(1024), Box::new(sink.clone()), quiet_hooks());
+    // The first paste stays charged while the worker is blocked behind the full write queue.
     session.paste(vec![b'a'; 40 * 1024 * 1024]).unwrap();
     assert_eq!(
         session.paste(vec![b'b'; 30 * 1024 * 1024]),
@@ -387,4 +392,5 @@ fn pastes_beyond_the_byte_budget_are_refused_and_the_budget_is_refunded() {
     );
     session.paste(vec![b'c'; 20 * 1024 * 1024]).unwrap();
     assert_eq!(session.paste(vec![b'd'; 8 * 1024 * 1024]), Err(WriteError::Full));
+    sink.0.store(true, std::sync::atomic::Ordering::Release);
 }
