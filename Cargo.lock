@@ -1875,6 +1875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-telnet"
+version = "0.1.0"
+dependencies = [
+ "term-engine",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

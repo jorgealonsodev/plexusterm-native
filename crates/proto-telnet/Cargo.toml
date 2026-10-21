@@ -1,0 +1,19 @@
+[package]
+name = "proto-telnet"
+description = "Telnet sessions over TCP with NAWS, TERMINAL-TYPE, ECHO and SGA, ported from PlexusTerm v0.2.15 (PRD TEL-1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+term-engine = { path = "../term-engine" }
+# Same versions as PlexusTerm v0.2.15's Cargo.lock.
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.3", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+
+[lints]
+workspace = true
