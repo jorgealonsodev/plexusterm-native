@@ -1,0 +1,25 @@
+[package]
+name = "local-files"
+description = "Local file operations of the Explorer and the file viewer (list, create, rename, move, delete, chmod, open, view and save text), ported from PlexusTerm v0.2.15 (PRD LOC-1, LOC-2, VIEW-2, VIEW-5, FIX-1, FIX-2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+proto-ssh = { path = "../proto-ssh" }
+# Same versions as PlexusTerm v0.2.15's Cargo.lock.
+encoding_rs = "=0.8.42"
+open = "=5.4.4"
+tempfile = "=3.27.0"
+
+# FIX-2: rename without replacing, through rustix's safe `renameat2(RENAME_NOREPLACE)` /
+# `renameatx_np(RENAME_EXCL)` wrapper (the version tempfile already uses).
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs", "std"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true

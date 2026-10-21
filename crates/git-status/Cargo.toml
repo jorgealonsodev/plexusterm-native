@@ -1,0 +1,22 @@
+[package]
+name = "git-status"
+description = "Git branch and file status of local and SSH folders, read-only and decorated like VS Code, ported from PlexusTerm v0.2.15 (PRD DEV-3, TREE-1, TREE-3, TREE-4, VIEW-2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+proto-ssh = { path = "../proto-ssh" }
+
+[dev-dependencies]
+proto-ssh = { path = "../proto-ssh", features = ["test-support"] }
+term-engine = { path = "../term-engine" }
+# Same versions as PlexusTerm v0.2.15's Cargo.lock.
+russh = "=0.64.1"
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+zeroize = "=1.9.1"
+
+[lints]
+workspace = true
