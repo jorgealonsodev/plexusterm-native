@@ -3,4 +3,6 @@
 //! (FONT-1), compatible with PlexusTerm v0.2.15.
 
 pub mod capture;
+pub mod json;
+pub mod settings;
 pub mod shortcuts;
