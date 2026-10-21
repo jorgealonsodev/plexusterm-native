@@ -8,6 +8,7 @@
 //! - [`monitor`]: remote monitor sample over an existing SSH session.
 
 pub mod keygen;
+pub mod scan;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
