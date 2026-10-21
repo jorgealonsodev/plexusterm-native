@@ -1,0 +1,26 @@
+[package]
+name = "tunnels"
+description = "SSH tunnels: local (-L), remote (-R) and dynamic SOCKS5 (-D) port forwards, ported from PlexusTerm v0.2.15 (PRD TUN-1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+proto-ssh = { path = "../proto-ssh" }
+# Same versions as PlexusTerm v0.2.15's Cargo.lock.
+russh = "=0.64.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "=2.0.21"
+tokio = { version = "=1.53.3", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+
+[dev-dependencies]
+core-secrets = { path = "../core-secrets", features = ["test-support"] }
+proto-ssh = { path = "../proto-ssh", features = ["test-support"] }
+serde_json = "=1.0.154"
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.3", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+zeroize = "=1.9.1"
+
+[lints]
+workspace = true

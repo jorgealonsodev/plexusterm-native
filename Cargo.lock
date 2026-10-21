@@ -2700,6 +2700,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnels"
+version = "0.1.0"
+dependencies = [
+ "core-secrets",
+ "proto-ssh",
+ "russh",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
