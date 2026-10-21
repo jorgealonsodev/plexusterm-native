@@ -1,0 +1,23 @@
+[package]
+name = "session-library"
+description = "Saved sessions and tunnels: the library model, forms, jump chains, password rules and imports, ported from PlexusTerm v0.2.15 (PRD SES-1, SES-2, SSH-3, SSH-6a, TUN-1a, DATA-1a)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+core-storage = { path = "../core-storage" }
+# Connection targets reuse the SSH crate's auth, keyring and jump host types.
+proto-ssh = { path = "../proto-ssh" }
+# tunnels.json entries reuse the tunnel crate's definition.
+tunnels = { path = "../tunnels" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "=1.0.154"
+zeroize = "=1.9.1"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true
