@@ -77,3 +77,11 @@ fn closing_wakes_a_writer_waiting_for_room() {
     ring.close();
     assert_eq!(writer.join().unwrap(), Err(Closed));
 }
+
+#[test]
+fn reports_whether_it_was_closed() {
+    let ring = ByteRing::new(4);
+    assert!(!ring.is_closed());
+    ring.close();
+    assert!(ring.is_closed());
+}

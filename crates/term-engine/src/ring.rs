@@ -132,6 +132,11 @@ impl ByteRing {
         self.0.writable.notify_all();
     }
 
+    /// Whether [`ByteRing::close`] was called (buffered bytes may still be waiting).
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
     /// Bytes currently buffered (never more than the capacity).
     pub fn len(&self) -> usize {
         self.lock().bytes.len()

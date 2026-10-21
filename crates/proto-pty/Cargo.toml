@@ -1,0 +1,14 @@
+[package]
+name = "proto-pty"
+description = "Local terminal sessions on a pseudo terminal (PRD TERM-1, TERM-15, TERM-16)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+portable-pty = "=0.9.0"
+term-engine = { path = "../term-engine" }
+
+[lints]
+workspace = true
