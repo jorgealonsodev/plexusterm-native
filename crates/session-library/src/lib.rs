@@ -16,6 +16,8 @@ pub mod password_flow;
 pub mod shell;
 pub mod target;
 mod text;
+pub mod tunnel_form;
+pub mod tunnel_library;
 
 pub use file::{LibraryError, load_library, parse_library, save_library, serialize_library};
 pub use library::{ChainError, LibraryAction, SessionLibrary, TreeNode, build_tree, normalize_folder, resolve_chain};
