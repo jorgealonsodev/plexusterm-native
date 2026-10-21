@@ -399,10 +399,12 @@ fn output_printed_before_the_exit_survives_a_slow_reader() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_foreground_job_gets_its_grace_period_to_save_on_hang_up() {
-    let marker = std::env::temp_dir().join(format!("plexus-pty-grace-{}", std::process::id()));
-    let _ = std::fs::remove_file(&marker);
+    // A fresh private directory: `create_dir` fails instead of following anything planted there.
+    let dir = std::env::temp_dir().join(format!("plexus-pty-grace-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir(&dir).expect("private scratch dir");
+    let marker = dir.join("saved");
     let job = format!(
-        "sh -c 'trap \"sleep 0.5; echo saved > {}; exit 0\" HUP; printf READY; while :; do sleep 0.1; done'; true",
+        "sh -c 'trap \"sleep 0.5; echo saved > \\\"$0\\\"; exit 0\" HUP; printf READY; while :; do sleep 0.1; done' '{}'; true",
         marker.display()
     );
     let spec = SpawnSpec {
@@ -420,5 +422,46 @@ fn a_foreground_job_gets_its_grace_period_to_save_on_hang_up() {
         assert!(Instant::now() < deadline, "the job was killed before it could save");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn killing_ends_a_pipeline_whose_leader_already_finished() {
+    // `true` leads the job's process group and exits at once; the consumer ignores the hang-up.
+    let spec = SpawnSpec {
+        program: Some("/bin/bash".into()),
+        args: vec![
+            "--norc".into(),
+            "-i".into(),
+            "-c".into(),
+            "true | sh -c 'trap \"\" HUP; printf JOB:$$:; while :; do sleep 1; done'; true".into(),
+        ],
+        columns: 80,
+        rows: 24,
+        ..SpawnSpec::default()
+    };
+    let (pty, _w, ring) = start(spec);
+    let mut text = read_until(&ring, "JOB:");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !text.rsplit("JOB:").next().is_some_and(|t| t.contains(':')) {
+        assert!(Instant::now() < deadline, "no job pid in {text:?}");
+        if let Some(bytes) = ring.try_pop(4096) {
+            text.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let job: u32 = text
+        .rsplit("JOB:")
+        .next()
+        .and_then(|t| t.split(':').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    pty.kill();
+    wait_for_exit(&pty);
+    assert!(
+        gone_within(job, Duration::from_secs(5)),
+        "pipeline member {job} survived"
+    );
 }

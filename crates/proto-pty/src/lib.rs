@@ -447,22 +447,36 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-/// Whether a live process leads `group` inside the session `session` (the shell's pid).
+/// Whether any live process of `group` runs inside the session `session` (the shell's pid).
+///
+/// Every process is checked, not just the group's leader: in a pipeline the leader (the first
+/// command) may have finished while the rest of the job still runs.
 #[cfg(target_os = "linux")]
 fn group_in_session(group: i32, session: i32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{group}/stat")) else {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
         return false;
     };
-    // After the command name: state, ppid, pgrp, session, ...
-    let mut fields = stat
-        .rsplit_once(')')
-        .map(|(_, rest)| rest)
-        .unwrap_or_default()
-        .split_whitespace();
-    let state = fields.next();
-    let pgrp = fields.nth(1).and_then(|f| f.parse::<i32>().ok());
-    let sid = fields.next().and_then(|f| f.parse::<i32>().ok());
-    state.is_some_and(|s| s != "Z") && pgrp == Some(group) && sid == Some(session)
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+        .any(|stat| {
+            // After the command name: state, ppid, pgrp, session, ...
+            let mut fields = stat
+                .rsplit_once(')')
+                .map(|(_, rest)| rest)
+                .unwrap_or_default()
+                .split_whitespace();
+            let state = fields.next();
+            let pgrp = fields.nth(1).and_then(|f| f.parse::<i32>().ok());
+            let sid = fields.next().and_then(|f| f.parse::<i32>().ok());
+            state.is_some_and(|s| s != "Z") && pgrp == Some(group) && sid == Some(session)
+        })
 }
 
 /// Without `/proc` the session cannot be checked; the group is assumed to still be the job's.
