@@ -24,8 +24,14 @@ pub enum Json {
 }
 
 impl Json {
+    /// Parses like `JSON.parse`, which reads a number too large for a double (`1e999`) as
+    /// Infinity where serde_json refuses the whole text. Such a number is read as `null`: v0.2.15
+    /// takes the default for a value that is not finite and `JSON.stringify` writes it as `null`,
+    /// so the rest of the file is kept exactly as v0.2.15 kept it.
     pub fn parse(text: &str) -> Option<Json> {
-        serde_json::from_str(text).ok()
+        serde_json::from_str(text)
+            .ok()
+            .or_else(|| serde_json::from_str(&finite_numbers(text)?).ok())
     }
 
     pub fn to_pretty_string(&self) -> String {
@@ -163,4 +169,46 @@ impl<'de> Deserialize<'de> for Json {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Json, D::Error> {
         deserializer.deserialize_any(JsonVisitor)
     }
+}
+
+/// `text` with every number literal outside strings that overflows a double replaced by `null`;
+/// `None` when there is none.
+fn finite_numbers(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut replaced = false;
+    let mut chars = text.char_indices().peekable();
+    let mut in_string = false;
+    while let Some((start, c)) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next().map(|(_, escaped)| escaped)),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        if c == '-' || c.is_ascii_digit() {
+            let mut end = start + c.len_utf8();
+            while let Some(&(i, next)) = chars.peek() {
+                if !(next.is_ascii_digit() || matches!(next, '.' | 'e' | 'E' | '+' | '-')) {
+                    break;
+                }
+                end = i + next.len_utf8();
+                chars.next();
+            }
+            let literal = text.get(start..end).unwrap_or_default();
+            match literal.parse::<f64>() {
+                Ok(value) if value.is_infinite() => {
+                    replaced = true;
+                    out.push_str("null");
+                }
+                _ => out.push_str(literal),
+            }
+            continue;
+        }
+        in_string = c == '"';
+        out.push(c);
+    }
+    replaced.then_some(out)
 }
