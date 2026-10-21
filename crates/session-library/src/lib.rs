@@ -7,8 +7,11 @@
 
 pub mod file;
 pub mod form;
+pub mod jump_hosts;
 pub mod library;
 pub mod model;
+pub mod panel;
+pub mod password_flow;
 pub mod shell;
 pub mod target;
 mod text;
