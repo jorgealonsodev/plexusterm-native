@@ -32,3 +32,10 @@ This license covers the iTerm-Color-Schemes repository collection of themes.
 The copyright/license for each individual theme belongs to the author of that theme.
 ```
 
+
+## gpui_wgpu (Zed)
+
+`vendor/gpui_wgpu` is `crates/gpui_wgpu` of [Zed](https://github.com/zed-industries/zed) at
+`a484d108da9164cd6a705e7422a0ddd33499fb50`, Copyright 2022 - 2025 Zed Industries, Inc., licensed
+under the Apache License, Version 2.0 (`vendor/gpui_wgpu/LICENSE-APACHE`). It is modified; the
+changes are listed in `vendor/gpui_wgpu/PATCHES.md` and its `NOTICE`.

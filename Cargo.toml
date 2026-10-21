@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Vendored third-party crate, built with its own manifest and lints (vendor/gpui_wgpu/PATCHES.md).
+exclude = ["vendor/gpui_wgpu"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,3 +28,8 @@ codegen-units = 1
 strip = true
 # ST-8: a failing session must end only its own pane, so panics unwind to the session supervisor.
 panic = "unwind"
+
+# D5/ST-13: gpui_wgpu at the pinned rev with one patch (Vulkan only, GL fallback); see
+# vendor/gpui_wgpu/PATCHES.md.
+[patch."https://github.com/zed-industries/zed"]
+gpui_wgpu = { path = "vendor/gpui_wgpu" }

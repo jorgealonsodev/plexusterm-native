@@ -1,0 +1,7 @@
+gpui_wgpu
+Copyright 2022 - 2025 Zed Industries, Inc.
+Licensed under the Apache License, Version 2.0 (LICENSE-APACHE).
+
+This copy comes from https://github.com/zed-industries/zed at
+a484d108da9164cd6a705e7422a0ddd33499fb50 (crates/gpui_wgpu) and was modified by the
+PlexusTerm Native authors; PATCHES.md lists every change.
