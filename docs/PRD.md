@@ -636,7 +636,7 @@ Every screen and dialog of v0.2.15 that native must reproduce, with its English 
 
 | ID | Requirement | Target |
 | --- | --- | --- |
-| NFR-1 | In-app latency (tier 1, gated) | `key_received → frame_submitted` p95 ≤ 8 ms, p99 ≤ 16 ms, idle and under load; frame submitted before the next vsync regardless of refresh rate |
+| NFR-1 | In-app latency (tier 1, gated) | `key_received → frame_submitted`: the echo is presented in the refresh after the key — p95 ≤ one refresh period + 4 ms and p99 ≤ one refresh period + 8 ms (60 Hz: 20.7 / 24.7 ms; 75 Hz: 17.3 / 21.3 ms), idle and under load. Owner decision 2026-10-21: GPUI paints on the display refresh, so a fixed 8 ms bound is unreachable below 125 Hz; the budget is the work on top of the refresh wait |
 | NFR-2 | Throughput | `vtebench` (`dense_cells`, `scrolling`, `unicode`, `cursor_motion`) within 1.5× of Alacritty; `cat` 100 MB with no frame interval > 100 ms and Ctrl+C acknowledged ≤ 100 ms; scrolling 10 000 lines ≥ 55 fps p5 |
 | NFR-2a | Output batching | The source reader batches output before waking the parser/UI (§6.3): the first output after a quiet moment is delivered at once, a burst is gathered into few batches without loss or reordering, and a batch never grows past 64 KiB (v0.2.15 `SR/terminal/coalesce.rs:16-20`: `BURST_GAP` 8 ms, `WINDOW` 4 ms, `MAX_BATCH` 64 KiB; ported behaviour and tests) |
 | NFR-3 | Startup | ≤ 300 ms to the first frame containing the shell prompt, warm cache; cold cache reported |
